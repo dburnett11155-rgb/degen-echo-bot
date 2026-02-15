@@ -1,7 +1,7 @@
 {
   "name": "degen-echo-bot",
   "version": "1.0.0",
-  "description": "Degen Echo Chamber Telegram bot",
+  "description": "Degen Echo Chamber Telegram bot with real-time price polls",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -13,6 +13,6 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "author": "Your Name",
+  "author": "Donnie",
   "license": "MIT"
 }
