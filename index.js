@@ -1,24 +1,32 @@
 const { Telegraf } = require('telegraf');
-const axios = require('axios'); // for CoinGecko price check
+const axios = require('axios');
 
-const bot = new Telegraf('8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o');
-
-// Global pot tracker (simple simulation – later use real Solana tx)
+// Global pot tracker (simulated – later use real Solana)
 let currentPot = 0;
 const rakeRate = 0.20; // 20%
 const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK'; // your Phantom address
 
+const bot = new Telegraf('8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o');
+
 // /start
 bot.start((ctx) => ctx.reply('Degen Echo Bot online! Commands: /poll (start prediction), /stake <amount> (join pot), /chaos (sentiment score)'));
 
-// /poll – dynamic anonymous poll with 1-hour auto-close
+// /poll – dynamic anonymous poll with 1-hour auto-close + retry on axios
 bot.command('poll', async (ctx) => {
+  let solPrice = 'unknown';
   try {
-    // Fetch current SOL price for dynamic question
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    const solPrice = response.data.solana.usd;
-    const question = `Degen Echo – $SOL at $${solPrice} – next 1H vibe?`;
+    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {
+      timeout: 5000  // 5-second timeout to prevent hanging
+    });
+    solPrice = response.data.solana.usd;
+  } catch (error) {
+    console.error('CoinGecko fetch failed:', error.message);
+    solPrice = 'unknown (API error)';
+  }
 
+  const question = `Degen Echo – $SOL at $${solPrice} – next 1H vibe?`;
+
+  try {
     const poll = await ctx.replyWithPoll(
       question,
       ['🚀 Pump', '💀 Dump', '🤷 Stagnate'],
@@ -27,11 +35,10 @@ bot.command('poll', async (ctx) => {
         open_period: 3600  // 1 hour auto-close
       }
     );
-
     ctx.reply('Poll started! Closes in 1 hour. Stake with /stake 0.001 SOL');
-  } catch (error) {
-    ctx.reply('Error starting poll – try again!');
-    console.error(error);
+  } catch (pollError) {
+    ctx.reply('Error creating poll – try again!');
+    console.error('Poll creation failed:', pollError.message);
   }
 });
 
