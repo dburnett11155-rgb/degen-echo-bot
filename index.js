@@ -2,17 +2,17 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const cheerio = require('cheerio');
 
-// Solana-native coins
-const solanaCoins = ['solana', 'bonk1', 'dogwifhat', 'jupiter']; // CoinMarketCap slugs
+// Solana-native coins (CoinMarketCap slugs)
+const solanaCoins = ['solana', 'bonk1', 'dogwifhat', 'jupiter'];
 
-// Global pot tracker (simulated)
+// Global pot tracker (simulated – later real Solana tx)
 let currentPot = 0;
-const rakeRate = 0.20;
-const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK';
+const rakeRate = 0.20; // 20%
+const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK'; // your Phantom address
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const bot = new Telegraf('8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o');
 
-// Scrape real-time price from CoinMarketCap
+// Helper: Scrape real-time price from CoinMarketCap (no API, pure HTML scrape)
 async function getPrice(coinSlug) {
   try {
     const url = `https://coinmarketcap.com/currencies/${coinSlug}/`;
@@ -23,12 +23,13 @@ async function getPrice(coinSlug) {
       }
     });
     const $ = cheerio.load(response.data);
+    // CoinMarketCap price selector (stable in 2026 – check dev tools if it changes)
     const priceText = \( ('.priceValue').first().text().trim().replace(' \)', '').replace(/,/g, '');
     const price = parseFloat(priceText);
-    return isNaN(price) ? null : price;
+    return isNaN(price) ? 'unknown' : price.toFixed(6);
   } catch (error) {
     console.error(`Scrape failed for ${coinSlug}:`, error.message);
-    return null;
+    return 'unknown (scrape error)';
   }
 }
 
@@ -44,10 +45,8 @@ bot.command('poll', async (ctx) => {
     const coinSymbol = coinSlug === 'solana' ? 'SOL' : coinSlug.toUpperCase();
     const pollNumber = i + 1;
 
-    const startPrice = await getPrice(coinSlug);
-    const priceDisplay = startPrice ? startPrice.toFixed(2) : 'unknown';
-
-    const question = `Degen Echo #${pollNumber} – \[ {coinSymbol} at \]{priceDisplay} – next 1H vibe?`;
+    const price = await getPrice(coinSlug);
+    const question = `Degen Echo #${pollNumber} – \[ {coinSymbol} at \]{price} – next 1H vibe?`;
 
     try {
       await ctx.replyWithPoll(
@@ -55,7 +54,7 @@ bot.command('poll', async (ctx) => {
         ['🚀 Pump', '💀 Dump', '🤷 Stagnate'],
         {
           is_anonymous: true,
-          open_period: 3600
+          open_period: 3600  // 1 hour auto-close
         }
       );
     } catch (pollError) {
