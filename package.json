@@ -1,7 +1,7 @@
 {
   "name": "degen-echo-bot",
   "version": "1.0.0",
-  "description": "Degen Echo Chamber Telegram bot with scraped real-time prices",
+  "description": "Degen Echo Chamber Telegram bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
