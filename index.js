@@ -5,17 +5,14 @@ const cheerio = require('cheerio');
 // Solana-native coins
 const solanaCoins = ['solana', 'bonk1', 'dogwifhat', 'jupiter']; // CoinMarketCap slugs
 
-// Global pot tracker (simulated – later real Solana tx)
+// Global pot tracker (simulated)
 let currentPot = 0;
-const rakeRate = 0.20; // 20%
-const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK'; // your Phantom address
+const rakeRate = 0.20;
+const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK';
 
-// Store poll data (poll ID → {coin, startPrice, pollNumber})
-const activePolls = {};
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const bot = new Telegraf('8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o');
-
-// Helper: Scrape real-time price from CoinMarketCap
+// Scrape real-time price from CoinMarketCap
 async function getPrice(coinSlug) {
   try {
     const url = `https://coinmarketcap.com/currencies/${coinSlug}/`;
@@ -30,7 +27,7 @@ async function getPrice(coinSlug) {
     const price = parseFloat(priceText);
     return isNaN(price) ? null : price;
   } catch (error) {
-    console.error(`CoinMarketCap scrape failed for ${coinSlug}:`, error.message);
+    console.error(`Scrape failed for ${coinSlug}:`, error.message);
     return null;
   }
 }
@@ -38,7 +35,7 @@ async function getPrice(coinSlug) {
 // /start
 bot.start((ctx) => ctx.reply('Degen Echo Bot online! Commands: /poll (start 4 polls), /stake <amount> <poll#> (join pot), /chaos (sentiment score)'));
 
-// /poll – creates 4 separate polls with starting price recorded
+// /poll – creates 4 separate polls with scraped prices
 bot.command('poll', async (ctx) => {
   ctx.reply('Starting 4 separate polls for SOL, BONK, WIF, and JUP!');
 
@@ -48,15 +45,12 @@ bot.command('poll', async (ctx) => {
     const pollNumber = i + 1;
 
     const startPrice = await getPrice(coinSlug);
-    if (!startPrice) {
-      ctx.reply(`Error fetching starting price for \[ {coinSymbol} – skipping poll #${pollNumber}!`);
-      continue;
-    }
+    const priceDisplay = startPrice ? startPrice.toFixed(2) : 'unknown';
 
-    const question = `Degen Echo #${pollNumber} – \]{coinSymbol} at \[ {startPrice.toFixed(2)} – next 1H vibe?`;
+    const question = `Degen Echo #${pollNumber} – \[ {coinSymbol} at \]{priceDisplay} – next 1H vibe?`;
 
     try {
-      const pollMessage = await ctx.replyWithPoll(
+      await ctx.replyWithPoll(
         question,
         ['🚀 Pump', '💀 Dump', '🤷 Stagnate'],
         {
@@ -64,38 +58,6 @@ bot.command('poll', async (ctx) => {
           open_period: 3600
         }
       );
-
-      // Store poll data
-      activePolls[pollMessage.poll.id] = {
-        coin: coinSymbol,
-        startPrice,
-        pollNumber,
-        messageId: pollMessage.message_id,
-        chatId: ctx.chat.id
-      };
-
-      // Schedule auto-close check (simulated – later use cron or n8n)
-      setTimeout(async () => {
-        const pollData = activePolls[pollMessage.poll.id];
-        if (!pollData) return;
-
-        const endPrice = await getPrice(coinSlug);
-        if (!endPrice) {
-          ctx.telegram.sendMessage(pollData.chatId, `Poll #${pollData.pollNumber} closed – unable to fetch ending price for \]{pollData.coin}`);
-          delete activePolls[pollMessage.poll.id];
-          return;
-        }
-
-        const change = ((endPrice - pollData.startPrice) / pollData.startPrice) * 100;
-        let outcome = 'Stagnate';
-        if (change > 0.5) outcome = 'Pump';
-        else if (change < -0.5) outcome = 'Dump';
-
-        ctx.telegram.sendMessage(pollData.chatId, `Poll #${pollData.pollNumber} closed! Winner: ${outcome} – $${pollData.coin} actually \( {change.toFixed(2)}% ( \){outcome === 'Stagnate' ? 'within ±0.5%' : outcome})! Pot: ${currentPot} SOL`);
-
-        delete activePolls[pollMessage.poll.id];
-      }, 3600 * 1000); // 1 hour in ms
-
     } catch (pollError) {
       ctx.reply(`Error creating poll #${pollNumber} – skipping!`);
       console.error('Poll creation failed:', pollError.message);
