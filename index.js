@@ -1,32 +1,62 @@
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const cheerio = require('cheerio');
 
-// Solana-native coins with excellent DexScreener coverage
-const solanaCoins = ['SOL', 'BONK', 'WIF', 'JUP'];
+// Solana-native coins
+const solanaCoins = ['solana', 'bonk1', 'dogwifhat', 'jupiter']; // CoinMarketCap slugs
 
-// Global pot tracker (simulated – later use real Solana tx)
+// Global pot tracker (simulated – later real Solana tx)
 let currentPot = 0;
 const rakeRate = 0.20; // 20%
 const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK'; // your Phantom address
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// Store poll data (poll ID → {coin, startPrice, pollNumber})
+const activePolls = {};
+
+const bot = new Telegraf('8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o');
+
+// Helper: Scrape real-time price from CoinMarketCap
+async function getPrice(coinSlug) {
+  try {
+    const url = `https://coinmarketcap.com/currencies/${coinSlug}/`;
+    const response = await axios.get(url, {
+      timeout: 5000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
+    const $ = cheerio.load(response.data);
+    const priceText = \( ('.priceValue').first().text().trim().replace(' \)', '').replace(/,/g, '');
+    const price = parseFloat(priceText);
+    return isNaN(price) ? null : price;
+  } catch (error) {
+    console.error(`CoinMarketCap scrape failed for ${coinSlug}:`, error.message);
+    return null;
+  }
+}
 
 // /start
-bot.start((ctx) => ctx.reply('Degen Echo Bot online! Commands: /poll (start 4 polls), /stake <amount> <poll#> (e.g. /stake 0.001 1), /chaos (sentiment score)'));
+bot.start((ctx) => ctx.reply('Degen Echo Bot online! Commands: /poll (start 4 polls), /stake <amount> <poll#> (join pot), /chaos (sentiment score)'));
 
-// /poll – creates 4 separate polls with multi-API price fetch
+// /poll – creates 4 separate polls with starting price recorded
 bot.command('poll', async (ctx) => {
   ctx.reply('Starting 4 separate polls for SOL, BONK, WIF, and JUP!');
 
   for (let i = 0; i < solanaCoins.length; i++) {
-    const coin = solanaCoins[i];
+    const coinSlug = solanaCoins[i];
+    const coinSymbol = coinSlug === 'solana' ? 'SOL' : coinSlug.toUpperCase();
     const pollNumber = i + 1;
-    const price = await getPrice(coin);  // Multi-API chain
 
-    const question = `Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?`;
+    const startPrice = await getPrice(coinSlug);
+    if (!startPrice) {
+      ctx.reply(`Error fetching starting price for \[ {coinSymbol} – skipping poll #${pollNumber}!`);
+      continue;
+    }
+
+    const question = `Degen Echo #${pollNumber} – \]{coinSymbol} at \[ {startPrice.toFixed(2)} – next 1H vibe?`;
 
     try {
-      await ctx.replyWithPoll(
+      const pollMessage = await ctx.replyWithPoll(
         question,
         ['🚀 Pump', '💀 Dump', '🤷 Stagnate'],
         {
@@ -34,46 +64,44 @@ bot.command('poll', async (ctx) => {
           open_period: 3600
         }
       );
+
+      // Store poll data
+      activePolls[pollMessage.poll.id] = {
+        coin: coinSymbol,
+        startPrice,
+        pollNumber,
+        messageId: pollMessage.message_id,
+        chatId: ctx.chat.id
+      };
+
+      // Schedule auto-close check (simulated – later use cron or n8n)
+      setTimeout(async () => {
+        const pollData = activePolls[pollMessage.poll.id];
+        if (!pollData) return;
+
+        const endPrice = await getPrice(coinSlug);
+        if (!endPrice) {
+          ctx.telegram.sendMessage(pollData.chatId, `Poll #${pollData.pollNumber} closed – unable to fetch ending price for \]{pollData.coin}`);
+          delete activePolls[pollMessage.poll.id];
+          return;
+        }
+
+        const change = ((endPrice - pollData.startPrice) / pollData.startPrice) * 100;
+        let outcome = 'Stagnate';
+        if (change > 0.5) outcome = 'Pump';
+        else if (change < -0.5) outcome = 'Dump';
+
+        ctx.telegram.sendMessage(pollData.chatId, `Poll #${pollData.pollNumber} closed! Winner: ${outcome} – $${pollData.coin} actually \( {change.toFixed(2)}% ( \){outcome === 'Stagnate' ? 'within ±0.5%' : outcome})! Pot: ${currentPot} SOL`);
+
+        delete activePolls[pollMessage.poll.id];
+      }, 3600 * 1000); // 1 hour in ms
+
     } catch (pollError) {
       ctx.reply(`Error creating poll #${pollNumber} – skipping!`);
       console.error('Poll creation failed:', pollError.message);
     }
   }
 });
-
-// Helper: Try multiple public APIs in order (Binance → CoinGecko → DexScreener)
-async function getPrice(coin) {
-  const apis = [
-    // 1. Binance (fastest, no key)
-    async () => {
-      const symbol = coin === 'SOL' ? 'SOLUSDT' : coin === 'BONK' ? 'BONKUSDT' : coin === 'WIF' ? 'WIFUSDT' : 'JUPUSDT';
-      const res = await axios.get(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, { timeout: 3000 });
-      return Number(res.data.price).toFixed(6);
-    },
-    // 2. CoinGecko (no key for simple price)
-    async () => {
-      const id = coin.toLowerCase();
-      const res = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`, { timeout: 3000 });
-      return res.data[id].usd.toFixed(6);
-    },
-    // 3. DexScreener (fallback for Solana DEX)
-    async () => {
-      const res = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${coin}`, { timeout: 5000 });
-      const pair = res.data.pairs.find(p => p.baseToken.symbol === coin || p.quoteToken.symbol === coin);
-      return pair ? Number(pair.priceUsd).toFixed(6) : 'unknown';
-    }
-  ];
-
-  for (const api of apis) {
-    try {
-      return await api();
-    } catch (e) {
-      console.error(`API failed:`, e.message);
-    }
-  }
-
-  return 'unknown (all APIs failed)';
-}
 
 // /stake – stake into a specific poll's pot
 bot.command('stake', (ctx) => {
