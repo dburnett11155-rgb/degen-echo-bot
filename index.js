@@ -1,7 +1,7 @@
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
 
-// Global pot tracker (simulated – later use real Solana)
+// Global pot tracker (simulated – later use real Solana tx)
 let currentPot = 0;
 const rakeRate = 0.20; // 20%
 const rakeWallet = '9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK'; // your Phantom address
@@ -11,16 +11,16 @@ const bot = new Telegraf('8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o');
 // /start
 bot.start((ctx) => ctx.reply('Degen Echo Bot online! Commands: /poll (start prediction), /stake <amount> (join pot), /chaos (sentiment score)'));
 
-// /poll – dynamic anonymous poll with 1-hour auto-close + retry on axios
+// /poll – dynamic anonymous poll with 1-hour auto-close + Binance API
 bot.command('poll', async (ctx) => {
   let solPrice = 'unknown';
   try {
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {
-      timeout: 5000  // 5-second timeout to prevent hanging
+    const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', {
+      timeout: 5000  // 5-second timeout
     });
-    solPrice = response.data.solana.usd;
+    solPrice = Number(response.data.price).toFixed(2);
   } catch (error) {
-    console.error('CoinGecko fetch failed:', error.message);
+    console.error('Binance fetch failed:', error.message);
     solPrice = 'unknown (API error)';
   }
 
@@ -58,12 +58,4 @@ bot.command('stake', (ctx) => {
 });
 
 // /chaos – simple random sentiment score
-bot.command('chaos', (ctx) => {
-  const score = Math.floor(Math.random() * 100) + 1;
-  const vibe = score > 70 ? 'bullish 🔥' : score < 30 ? 'bearish 💀' : 'neutral 🤷';
-  ctx.reply(`Chaos Score: ${score}/100 – Vibe: ${vibe}`);
-});
-
-// Launch bot
-bot.launch();
-console.log('Degen Echo Bot is running');
+bot.command('chaos',
