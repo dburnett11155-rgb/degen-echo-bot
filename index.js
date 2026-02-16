@@ -1,13 +1,20 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Coins (AscendEX symbols)
-const coins = {
-  SOL: "SOL/USDT",
-  BONK: "BONK/USDT",
-  WIF: "WIF/USDT",
-  JUP: "JUP/USDT"
-};
+// Global error handlers (prevents full crash)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+});
+
+// Solana coins
+const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
+
+// AscendEX symbols
+const ascendexSymbols = ["SOL/USDT", "BONK/USDT", "WIF/USDT", "JUP/USDT"];
 
 // Real-time prices
 const prices = {
@@ -31,12 +38,11 @@ let ws = new WebSocket("wss://ascendex.com/0/api/pro/v1/stream");
 
 ws.on("open", () => {
   console.log("AscendEX WS connected");
-  // Subscribe to tickers
   ws.send(JSON.stringify({
     method: "sub.ticker",
     id: 1,
     params: {
-      symbol: Object.values(coins)
+      symbol: ascendexSymbols
     }
   }));
 });
@@ -46,20 +52,20 @@ ws.on("message", (data) => {
     const msg = JSON.parse(data);
     if (msg.m === "ticker" && msg.data && msg.data.symbol) {
       const symbol = msg.data.symbol;
-      const coin = Object.keys(coins).find(k => coins[k] === symbol);
-      if (coin && msg.data.close) {
+      const coin = symbol.split('/')[0];
+      if (solanaCoins.includes(coin)) {
         prices[coin] = Number(msg.data.close).toFixed(coin === "BONK" ? 8 : 2);
       }
     }
   } catch (e) {
-    console.error("AscendEX parse error:", e.message);
+    console.error("WS parse error:", e.message);
   }
 });
 
-ws.on("error", (error) => console.error("AscendEX WS error:", error.message));
+ws.on("error", (error) => console.error("WS error:", error.message));
 
 ws.on("close", () => {
-  console.log("AscendEX WS closed – reconnecting in 5s...");
+  console.log("WS closed – reconnecting in 5s...");
   setTimeout(() => {
     ws = new WebSocket("wss://ascendex.com/0/api/pro/v1/stream");
     ws.on("open", () => {});
@@ -70,86 +76,120 @@ ws.on("close", () => {
 });
 
 // /start
-bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
+bot.start((ctx) => {
+  try {
+    ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)");
+  } catch (e) {
+    console.error("Start error:", e.message);
+  }
+});
 
 // /poll
 bot.command("poll", async (ctx) => {
-  ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
+  try {
+    ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
-  for (let i = 0; i < solanaCoins.length; i++) {
-    const coin = solanaCoins[i];
-    const pollNumber = i + 1;
-    const price = prices[coin] || "unknown";
+    for (let i = 0; i < solanaCoins.length; i++) {
+      const coin = solanaCoins[i];
+      const pollNumber = i + 1;
+      const price = prices[coin] || "unknown";
 
-    const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "🚀 Pump", callback_data: `vote_${pollNumber}_pump` },
-            { text: "📉 Dump", callback_data: `vote_${pollNumber}_dump` },
-            { text: "🟡 Stagnate", callback_data: `vote_${pollNumber}_stagnate` }
+      const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🚀 Pump", callback_data: `vote_${pollNumber}_pump` },
+              { text: "📉 Dump", callback_data: `vote_${pollNumber}_dump` },
+              { text: "🟡 Stagnate", callback_data: `vote_${pollNumber}_stagnate` }
+            ]
           ]
-        ]
-      }
-    });
+        }
+      });
 
-    activePolls[message.message_id] = {
-      coin,
-      pollNumber,
-      pot: 0,
-      stakes: []
-    };
+      activePolls[message.message_id] = {
+        coin,
+        pollNumber,
+        pot: 0,
+        stakes: []
+      };
+    }
+  } catch (e) {
+    console.error("Poll error:", e.message);
+    ctx.reply("Error creating polls – try again");
   }
 });
 
 // Handle button tap → ask for stake amount
 bot.on("callback_query", async (ctx) => {
-  const data = ctx.callbackQuery.data;
-  if (!data.startsWith("vote_")) return;
+  try {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith("vote_")) return;
 
-  const [_, pollNumberStr, choice] = data.split("_");
-  const pollNumber = parseInt(pollNumberStr);
-  const pollId = ctx.callbackQuery.message.message_id;
-  const pollData = activePolls[pollId];
+    const [_, pollNumberStr, choice] = data.split("_");
+    const pollNumber = parseInt(pollNumberStr);
+    const pollId = ctx.callbackQuery.message.message_id;
+    const pollData = activePolls[pollId];
 
-  if (!pollData) return ctx.answerCbQuery("Poll expired");
+    if (!pollData) return ctx.answerCbQuery("Poll expired");
 
-  const userId = ctx.callbackQuery.from.id;
+    const userId = ctx.callbackQuery.from.id;
 
-  await ctx.reply(`How much SOL do you want to stake on \( {choice} for poll # \){pollNumber}? Reply with amount (e.g. 0.001)`);
+    await ctx.reply(`How much SOL do you want to stake on \( {choice} for poll # \){pollNumber}? Reply with amount (e.g. 0.001)`);
 
-  const listener = bot.on("text", async (replyCtx) => {
-    if (replyCtx.from.id !== userId) return;
-    const amount = parseFloat(replyCtx.message.text.trim());
+    const listener = bot.on("text", async (replyCtx) => {
+      try {
+        if (replyCtx.from.id !== userId) return;
+        const amount = parseFloat(replyCtx.message.text.trim());
 
-    if (!amount || amount <= 0) {
-      return replyCtx.reply("Invalid amount – try again");
-    }
+        if (!amount || amount <= 0) {
+          return replyCtx.reply("Invalid amount – try again");
+        }
 
-    const rake = amount * rakeRate;
-    pollData.pot += amount;
-    pollData.stakes.push({ userId, amount });
+        const rake = amount * rakeRate;
+        pollData.pot += amount;
+        pollData.stakes.push({ userId, amount });
 
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      pollId,
-      undefined,
-      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
-      { reply_markup: ctx.callbackQuery.message.reply_markup }
-    );
+        await ctx.telegram.editMessageText(
+          ctx.chat.id,
+          pollId,
+          undefined,
+          `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+          { reply_markup: ctx.callbackQuery.message.reply_markup }
+        );
 
-    await replyCtx.reply(`Staked ${amount} SOL on \( {choice} for poll # \){pollNumber}! Pot now: ${pollData.pot.toFixed(6)} SOL (rake: ${rake.toFixed(6)})`);
-    bot.off("text", listener);
-  });
+        await replyCtx.reply(`Staked ${amount} SOL on \( {choice} for poll # \){pollNumber}! Pot now: ${pollData.pot.toFixed(6)} SOL (rake: ${rake.toFixed(6)})`);
+      } catch (e) {
+        console.error("Stake listener error:", e.message);
+      }
+      bot.off("text", listener);
+    });
+  } catch (e) {
+    console.error("Callback error:", e.message);
+    ctx.answerCbQuery("Error processing vote");
+  }
 });
 
 // /chaos
 bot.command("chaos", (ctx) => {
-  const score = Math.floor(Math.random() * 100) + 1;
-  const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
-  ctx.reply(`Chaos Score: ${score}/100 – Vibe: ${vibe}`);
+  try {
+    const score = Math.floor(Math.random() * 100) + 1;
+    const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
+    ctx.reply(`Chaos Score: ${score}/100 – Vibe: ${vibe}`);
+  } catch (e) {
+    console.error("Chaos error:", e.message);
+  }
 });
 
-// Launch
-bot.launch();
-console.log("Degen Echo Bot is running");
+// Launch with error handling
+try {
+  bot.launch();
+  console.log("Degen Echo Bot is running");
+} catch (e) {
+  console.error("Bot launch error:", e.message);
+}
+
+// Keep process alive
+process.on('SIGINT', () => {
+  bot.stop('SIGINT');
+  process.exit(0);
+});
