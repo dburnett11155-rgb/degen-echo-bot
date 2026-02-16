@@ -12,8 +12,10 @@ const prices = {
   "JUP/USD": "unknown"
 };
 
-// Simulated pot per poll
-const pots = { 1: 0, 2: 0, 3: 0, 4: 0 };
+// Per-poll data (poll message ID → {coin, pot: 0, stakes: []})
+const activePolls = {};
+
+// Rake
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
@@ -23,7 +25,7 @@ const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 let ws = new WebSocket("wss://ws.kraken.com");
 
 ws.on("open", () => {
-  console.log("Kraken WS connected");
+  console.log("Kraken WebSocket connected");
   ws.send(JSON.stringify({
     event: "subscribe",
     pair: solanaCoins,
@@ -42,16 +44,16 @@ ws.on("message", (data) => {
       }
     }
   } catch (e) {
-    console.error("WS parse error:", e.message);
+    console.error("WebSocket parse error:", e.message);
   }
 });
 
 ws.on("error", (error) => {
-  console.error("Kraken WS error:", error.message);
+  console.error("Kraken WebSocket error:", error.message);
 });
 
 ws.on("close", () => {
-  console.log("Kraken WS closed – reconnecting in 5s...");
+  console.log("Kraken WebSocket closed – reconnecting in 5s...");
   setTimeout(() => {
     ws = new WebSocket("wss://ws.kraken.com");
     ws.on("open", () => { /* same */ });
@@ -62,11 +64,11 @@ ws.on("close", () => {
 });
 
 // /start
-bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 🔥 polls, /stake <amount> <poll#> to join, /chaos for score"));
+bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
 
-// /poll – 4 separate polls with Kraken prices + emojis
+// /poll – creates 4 separate button polls with real-time Kraken prices
 bot.command("poll", async (ctx) => {
-  ctx.reply("🚀 Launching 4 separate polls for SOL, BONK, WIF, and JUP!");
+  ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
   for (let i = 0; i < solanaCoins.length; i++) {
     const pair = solanaCoins[i];
@@ -74,32 +76,71 @@ bot.command("poll", async (ctx) => {
     const pollNumber = i + 1;
     const price = prices[pair] || "unknown";
 
-    const question = `🔥 Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?`;
+    const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "🚀 Pump", callback_data: `vote_${pollNumber}_pump` },
+            { text: "📉 Dump", callback_data: `vote_${pollNumber}_dump` },
+            { text: "🟡 Stagnate", callback_data: `vote_${pollNumber}_stagnate` }
+          ]
+        ]
+      }
+    });
 
-    try {
-      await ctx.replyWithPoll(question, ["🚀 Pump", "📉 Dump", "🟡 Stagnate"], {
-        is_anonymous: true,
-        open_period: 3600
-      });
-    } catch (err) {
-      ctx.reply(`Error creating poll #${pollNumber} – skipping!`);
-    }
+    activePolls[message.message_id] = {
+      coin,
+      pollNumber,
+      pot: 0,
+      stakes: []  // {userId, amount}
+    };
   }
 });
 
-// /stake – simulate stake + rake
-bot.command("stake", (ctx) => {
-  const args = ctx.message.text.split(" ");
-  const amount = parseFloat(args[1]);
-  const pollNumber = parseInt(args[2]);
+// Handle button tap → ask for stake amount
+bot.on("callback_query", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("vote_")) return;
 
-  if (!amount || amount <= 0) return ctx.reply("Usage: /stake <amount> <poll#> (e.g. /stake 0.001 1)");
-  if (!pollNumber || pollNumber < 1 || pollNumber > 4) return ctx.reply("Poll # must be 1–4");
+  const [_, pollNumberStr, choice] = data.split("_");
+  const pollNumber = parseInt(pollNumberStr);
+  const pollId = ctx.callbackQuery.message.message_id;
+  const pollData = activePolls[pollId];
 
-  const rake = amount * rakeRate;
-  pots[pollNumber] += amount;
+  if (!pollData) return ctx.answerCbQuery("Poll expired");
 
-  ctx.reply(`💰 Staked \( {amount} SOL into poll # \){pollNumber}! Pot now: ${pots[pollNumber]} SOL (rake cut: ${rake.toFixed(6)} SOL to ${rakeWallet})`);
+  const userId = ctx.callbackQuery.from.id;
+
+  // Ask for stake amount
+  await ctx.reply(`How much SOL do you want to stake on \( {choice} for poll # \){pollNumber}? (reply with amount, e.g. 0.001)`);
+
+  // Listen for reply (simple – next message from user)
+  const listener = bot.on("text", async (replyCtx) => {
+    if (replyCtx.from.id !== userId) return;
+    const amount = parseFloat(replyCtx.message.text.trim());
+
+    if (!amount || amount <= 0) {
+      return replyCtx.reply("Invalid amount – try again");
+    }
+
+    const rake = amount * rakeRate;
+    pollData.pot += amount;
+    pollData.stakes.push({ userId, amount });
+
+    // Edit poll message to show updated pot
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      pollId,
+      undefined,
+      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pair] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+      {
+        reply_markup: ctx.callbackQuery.message.reply_markup
+      }
+    );
+
+    await replyCtx.reply(`Staked ${amount} SOL on \( {choice} for poll # \){pollNumber}! Pot now: ${pollData.pot.toFixed(6)} SOL (rake: ${rake.toFixed(6)})`);
+    bot.off("text", listener); // Stop listening after stake
+  });
 });
 
 // /chaos – random score
