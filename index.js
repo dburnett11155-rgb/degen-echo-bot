@@ -95,11 +95,13 @@ function buildPollMessage(pollNumber, coin, price, pot) {
 
 // /start
 bot.start((ctx) => {
+  console.log("Start command received");
   ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)");
 });
 
 // /poll
 bot.command("poll", async (ctx) => {
+  console.log("Poll command received");
   try {
     await ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
@@ -129,6 +131,7 @@ bot.command("poll", async (ctx) => {
         pot: 0,
         stakes: []
       };
+      console.log("Created poll #" + pollNumber + " with message ID: " + message.message_id);
     }
   } catch (error) {
     console.error("Poll command error:", error);
@@ -138,6 +141,7 @@ bot.command("poll", async (ctx) => {
 
 // /chaos
 bot.command("chaos", (ctx) => {
+  console.log("Chaos command received");
   try {
     const score = Math.floor(Math.random() * 100) + 1;
     const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
@@ -149,6 +153,7 @@ bot.command("chaos", (ctx) => {
 
 // Handle button tap
 bot.on("callback_query", async (ctx) => {
+  console.log("Callback query received:", ctx.callbackQuery.data);
   try {
     const data = ctx.callbackQuery.data;
     if (!data.startsWith("vote_")) {
@@ -161,6 +166,9 @@ bot.on("callback_query", async (ctx) => {
     const choice = parts[2];
     const pollId = ctx.callbackQuery.message.message_id;
     const pollData = activePolls[pollId];
+
+    console.log("Vote for poll #" + pollNumber + ", choice: " + choice + ", pollId: " + pollId);
+    console.log("Poll data found:", pollData ? "YES" : "NO");
 
     if (!pollData) {
       return ctx.answerCbQuery("Poll expired or not found");
@@ -183,9 +191,14 @@ bot.on("callback_query", async (ctx) => {
       timestamp: Date.now()
     };
 
+    console.log("Waiting for stake amount from user " + userId + " in chat " + chatId);
+    console.log("Context stored with key:", waitKey);
+    console.log("Current bot.context keys:", Object.keys(bot.context));
+
     // Auto-clear context after 5 minutes to prevent memory leaks
     setTimeout(() => {
-      if (bot.context[waitKey] && bot.context[waitKey].timestamp === bot.context[waitKey].timestamp) {
+      if (bot.context[waitKey]) {
+        console.log("Auto-clearing expired context for:", waitKey);
         delete bot.context[waitKey];
       }
     }, 300000);
@@ -198,22 +211,37 @@ bot.on("callback_query", async (ctx) => {
 
 // Handle stake amount replies (MUST come after all commands)
 bot.on("text", async (ctx) => {
+  console.log("Text message received:", ctx.message.text);
+  console.log("From user ID:", ctx.from.id, "in chat:", ctx.chat.id);
+  
   try {
     const userId = ctx.from.id;
     const chatId = ctx.chat.id;
     const waitKey = chatId + "_" + userId;
 
+    console.log("Looking for context key:", waitKey);
+    console.log("Available context keys:", Object.keys(bot.context));
+    console.log("Context found:", bot.context[waitKey] ? "YES" : "NO");
+
     // Skip if no pending stake for this user
-    if (!bot.context[waitKey]) return;
+    if (!bot.context[waitKey]) {
+      console.log("No pending stake for this user, ignoring message");
+      return;
+    }
 
     const stakeData = bot.context[waitKey];
     delete bot.context[waitKey];
 
+    console.log("Processing stake for poll #" + stakeData.pollNumber);
+
     const amount = parseFloat(ctx.message.text.trim());
 
     if (isNaN(amount) || amount <= 0) {
+      console.log("Invalid amount entered:", ctx.message.text);
       return ctx.reply("Invalid amount – please enter a valid number greater than 0");
     }
+
+    console.log("Valid amount entered:", amount);
 
     const rake = amount * rakeRate;
     const netAmount = amount - rake;
@@ -236,6 +264,8 @@ bot.on("text", async (ctx) => {
       stakeData.pollData.pot
     );
 
+    console.log("Updating poll message:", stakeData.pollId);
+
     await ctx.telegram.editMessageText(
       stakeData.chatId,
       stakeData.pollId,
@@ -254,11 +284,15 @@ bot.on("text", async (ctx) => {
       console.error("Error updating poll message:", error.message);
     });
 
+    console.log("Sending confirmation message");
+
     await ctx.reply(
       "✅ Staked " + amount + " SOL on " + stakeData.choice + " for poll #" + stakeData.pollNumber + 
       "!\n\nPot now: " + stakeData.pollData.pot.toFixed(6) + " SOL\nRake: " + rake.toFixed(6) + 
       " SOL → " + rakeWallet
     );
+
+    console.log("Stake processed successfully");
 
   } catch (error) {
     console.error("Text handler error:", error);
