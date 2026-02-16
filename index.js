@@ -1,4 +1,15 @@
- const { Telegraf } = require("telegraf");
+// Global error handlers - prevent full crash on any unhandled error
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Do NOT exit - keep running
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Do NOT exit - keep running
+});
+
+const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
 // Global error handling
