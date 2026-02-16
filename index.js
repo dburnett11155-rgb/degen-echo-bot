@@ -173,3 +173,52 @@ bot.command("chaos", (ctx) => {
 // Launch
 bot.launch();
 console.log("Degen Echo Bot is running");
+
+
+// Fix for stake reply not working - add scoped collector fallback
+bot.on("callback_query", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+  if (!data.startsWith("vote_")) return;
+
+  const [_, pollNumberStr, choice] = data.split("_");
+  const pollNumber = parseInt(pollNumberStr);
+  const pollId = ctx.callbackQuery.message.message_id;
+  const pollData = activePolls[pollId];
+
+  if (!pollData) return ctx.answerCbQuery("Poll expired");
+
+  const userId = ctx.callbackQuery.from.id;
+
+  await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
+
+  const filter = m => m.author.id === userId;
+  const collector = ctx.channel.createMessageCollector({ filter, max: 1, time: 60000 });
+
+  collector.on("collect", async m => {
+    const amount = parseFloat(m.content.trim());
+
+    if (!amount || amount <= 0) {
+      return m.reply("Invalid amount – try again");
+    }
+
+    const rake = amount * rakeRate;
+    pollData.pot += amount;
+    pollData.stakes.push({ userId: userId, amount, choice });
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      pollId,
+      undefined,
+      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pair] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
+      { reply_markup: ctx.callbackQuery.message.reply_markup }
+    );
+
+    await m.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
+  });
+
+  collector.on("end", (collected, reason) => {
+    if (reason === "time") {
+      ctx.reply("Stake timed out – try again with /poll");
+    }
+  });
+});
