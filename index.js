@@ -121,14 +121,12 @@ bot.command("poll", async (ctx) => {
   }
 });
 
-// Handle button tap
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
   if (!data.startsWith("vote_")) return;
 
-  const parts = data.split("_");
-  const pollNumber = parseInt(parts[1]);
-  const choice = parts[2];
+  const [_, pollNumberStr, choice] = data.split("_");
+  const pollNumber = parseInt(pollNumberStr);
   const pollId = ctx.callbackQuery.message.message_id;
   const pollData = activePolls[pollId];
 
@@ -138,8 +136,10 @@ bot.on("callback_query", async (ctx) => {
 
   await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
 
-  const listener = bot.on("text", async (replyCtx) => {
+  // Simple reply handler - checks next text message from this user
+  const tempListener = bot.on("text", async (replyCtx) => {
     if (replyCtx.from.id !== userId) return;
+
     const amount = parseFloat(replyCtx.message.text.trim());
 
     if (!amount || amount <= 0) {
@@ -148,7 +148,22 @@ bot.on("callback_query", async (ctx) => {
 
     const rake = amount * rakeRate;
     pollData.pot += amount;
-    pollData.stakes.push({ userId, amount });
+    pollData.stakes.push({ userId: userId, amount, choice });
+
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      pollId,
+      undefined,
+      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pair] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
+      { reply_markup: ctx.callbackQuery.message.reply_markup }
+    );
+
+    await replyCtx.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
+
+    // Remove this listener after successful stake
+    bot.off("text", tempListener);
+  });
+});
 
     await ctx.telegram.editMessageText(
       ctx.chat.id,
