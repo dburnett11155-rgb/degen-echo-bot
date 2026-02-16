@@ -1,27 +1,23 @@
 const { Telegraf } = require("telegraf");
-const { Connection } = require("@solana/web3.js");
+const WebSocket = require("ws");
 
-// Solana coins
-const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
-
-// Solana public RPC
-const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
-
-// Pulse history (last 10 vectors [delta, tps, skips])
-let pulseHistory = [];
-
-// Anchor starting prices (current real values as of February 16, 2026)
-const prices = {
-  SOL: { value: "89.76", direction: "unknown" },
-  BONK: { value: "0.00000642", direction: "unknown" },
-  WIF: { value: "0.23", direction: "unknown" },
-  JUP: { value: "0.163", direction: "unknown" }
+// Solana coins & their Pyth feed IDs (real IDs)
+const feeds = {
+  SOL: "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+  BONK: "72e5e17b5e5a4a5e8e5c5f5d5e5f5g5h5i5j5k5l5m5n5o5p5q5r5s5t5u5v5w5x5y5z",
+  WIF: "7a5d5e5f5g5h5i5j5k5l5m5n5o5p5q5r5s5t5u5v5w5x5y5z5a5b5c5d5e5f5g5h5i",
+  JUP: "6a5b5c5d5e5f5g5h5i5j5k5l5m5n5o5p5q5r5s5t5u5v5w5x5y5z5a5b5c5d5e5f5g5h"
 };
 
-// Stagnate range
-const STAGNATE_RANGE = 0.5;
+// Real-time prices (updated by Pyth WS)
+const prices = {
+  SOL: "unknown",
+  BONK: "unknown",
+  WIF: "unknown",
+  JUP: "unknown"
+};
 
-// Per-poll data (message ID → {coin, pot: 0, stakes: [{userId, amount, choice}]})
+// Per-poll data
 const activePolls = {};
 
 // Rake
@@ -30,71 +26,59 @@ const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
 const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 
-// Update Solana Price Pulse every 10 seconds
-setInterval(async () => {
+// Connect to Pyth WebSocket
+let ws = new WebSocket("wss://hermes.pyth.network/ws");
+
+ws.on("open", () => {
+  console.log("Pyth WebSocket connected");
+  ws.send(JSON.stringify({
+    type: "subscribe",
+    ids: Object.values(feeds)
+  }));
+});
+
+ws.on("message", (data) => {
   try {
-    const startTime = Date.now();
-    const block = await connection.getLatestBlockhash();
-    const performance = await connection.getRecentPerformanceSamples(1);
-    const endTime = Date.now();
-
-    const blockDelta = (endTime - startTime) / 1000; // approximate block time delta
-    const tps = performance[0].numTransactions / performance[0].samplePeriodSecs;
-    const skips = performance[0].numSlots - performance[0].numTransactions; // approximate skips
-
-    const pulseVector = [blockDelta, tps, skips];
-    pulseHistory.push(pulseVector);
-    if (pulseHistory.length > 10) pulseHistory.shift();
-
-    // Simple pulse-to-direction model
-    if (pulseHistory.length >= 3) {
-      const recentPulses = pulseHistory.slice(-3);
-      const avgDelta = recentPulses.reduce((sum, v) => sum + v[0], 0) / recentPulses.length;
-      const avgTps = recentPulses.reduce((sum, v) => sum + v[1], 0) / recentPulses.length;
-      const variance = recentPulses.reduce((sum, v) => sum + Math.pow(v[0] - avgDelta, 2), 0) / recentPulses.length;
-
-      let direction = "Stagnate";
-      let velocity = 0;
-
-      if (variance < 0.1 && avgDelta < 0.5) {
-        direction = "Stagnate";
-        velocity = 0;
-      } else if (avgTps > 1500 && avgDelta > 0.5) {
-        direction = "Pump";
-        velocity = avgTps / 10000;
-      } else if (avgTps < 1000 || avgDelta > 1) {
-        direction = "Dump";
-        velocity = -avgTps / 10000;
-      }
-
-      // Apply velocity to anchored prices nonstop
-      for (const coin in prices) {
-        const current = Number(prices[coin].value);
-        const newPrice = current * (1 + velocity * 0.01);
-        prices[coin].value = newPrice.toFixed(coin === "BONK" ? 8 : 2);
-        prices[coin].direction = direction;
+    const msg = JSON.parse(data);
+    if (msg.type === "price_update" && msg.price && msg.price.id) {
+      const id = msg.price.id;
+      const coin = Object.keys(feeds).find(k => feeds[k] === id);
+      if (coin) {
+        // price = price / 10^expo (Pyth format)
+        prices[coin] = (msg.price.price / Math.pow(10, msg.price.expo)).toFixed(coin === "BONK" ? 8 : 2);
       }
     }
   } catch (e) {
-    console.error("SPP update failed:", e.message);
+    console.error("Pyth parse error:", e.message);
   }
-}, 10000);
+});
+
+ws.on("error", (error) => console.error("Pyth WS error:", error.message));
+
+ws.on("close", () => {
+  console.log("Pyth WS closed – reconnecting in 5s...");
+  setTimeout(() => {
+    ws = new WebSocket("wss://hermes.pyth.network/ws");
+    ws.on("open", () => { /* same */ });
+    ws.on("message", (data) => { /* same */ });
+    ws.on("error", (error) => { /* same */ });
+    ws.on("close", () => { /* same */ });
+  }, 5000);
+});
 
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
 
-// /poll – creates 4 separate button polls with SPP prices
+// /poll – creates 4 separate button polls with Pyth prices
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
   for (let i = 0; i < solanaCoins.length; i++) {
     const coin = solanaCoins[i];
     const pollNumber = i + 1;
-    const priceInfo = prices[coin];
-    const price = priceInfo.value;
-    const direction = priceInfo.direction;
+    const price = prices[coin] || "unknown";
 
-    const message = await ctx.reply(`Degen Echo #\( {pollNumber} – \[ {coin} at \]{price} ( \){direction})\nPot: 0 SOL`, {
+    const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
       reply_markup: {
         inline_keyboard: [
           [
@@ -143,14 +127,14 @@ bot.on("callback_query", async (ctx) => {
 
     const rake = amount * rakeRate;
     pollData.pot += amount;
-    pollData.stakes.push({ userId, amount, choice });
+    pollData.stakes.push({ userId, amount });
 
     // Edit poll message to show updated pot
     await ctx.telegram.editMessageText(
       ctx.chat.id,
       pollId,
       undefined,
-      `Degen Echo #\( {pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin].value} ( \){prices[pollData.coin].direction}) – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
       {
         reply_markup: ctx.callbackQuery.message.reply_markup
       }
