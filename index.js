@@ -1,7 +1,7 @@
 const { Telegraf } = require("telegraf");
 const { Connection } = require("@solana/web3.js");
 
-// Solana coins
+// Solana coins – THIS LINE WAS MISSING OR CORRUPTED
 const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
 
 // Solana public RPC
