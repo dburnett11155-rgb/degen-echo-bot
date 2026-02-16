@@ -1,27 +1,27 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Solana coins (Binance symbols)
-const solanaCoins = ["SOLUSDT", "BONKUSDT", "WIFUSDT", "JUPUSDT"];
+// Solana coins (Kraken symbols)
+const solanaCoins = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
 
 // Real-time prices (updated by WebSocket)
 const prices = {
-  SOLUSDT: "unknown",
-  BONKUSDT: "unknown",
-  WIFUSDT: "unknown",
-  JUPUSDT: "unknown"
+  "SOL/USD": "unknown",
+  "BONK/USD": "unknown",
+  "WIF/USD": "unknown",
+  "JUP/USD": "unknown"
 };
 
-// Connect to Binance WebSocket for real-time trades (no key)
-const ws = new WebSocket("wss://stream.binance.com:9443/ws");
+// Connect to Kraken public WebSocket (no key)
+const ws = new WebSocket("wss://ws.kraken.com");
 
 ws.on("open", () => {
-  console.log("Binance WebSocket connected");
-  // Subscribe to trade streams for our coins
+  console.log("Kraken WebSocket connected");
+  // Subscribe to ticker for our coins
   const subscribeMsg = {
-    method: "SUBSCRIBE",
-    params: solanaCoins.map(coin => coin.toLowerCase() + "@trade"),
-    id: 1
+    event: "subscribe",
+    pair: solanaCoins,
+    subscription: { name: "ticker" }
   };
   ws.send(JSON.stringify(subscribeMsg));
 });
@@ -29,10 +29,11 @@ ws.on("open", () => {
 ws.on("message", (data) => {
   try {
     const message = JSON.parse(data);
-    if (message.s && message.p) {
-      const symbol = message.s;
-      if (solanaCoins.includes(symbol)) {
-        prices[symbol] = Number(message.p).toFixed(6);
+    if (Array.isArray(message) && message[1] && message[1].c) {
+      const pair = message[3]; // Kraken pair name
+      const price = message[1].c[0]; // Close price
+      if (solanaCoins.includes(pair)) {
+        prices[pair] = Number(price).toFixed(6);
       }
     }
   } catch (e) {
@@ -41,15 +42,14 @@ ws.on("message", (data) => {
 });
 
 ws.on("error", (error) => {
-  console.error("WebSocket error:", error.message);
+  console.error("Kraken WebSocket error:", error.message);
 });
 
 ws.on("close", () => {
-  console.log("WebSocket closed – reconnecting in 5s...");
+  console.log("Kraken WebSocket closed – reconnecting in 5s...");
   setTimeout(() => {
-    // Reconnect logic (simple)
-    const newWs = new WebSocket("wss://stream.binance.com:9443/ws");
-    // Re-attach events (copy from above)
+    const newWs = new WebSocket("wss://ws.kraken.com");
+    // Re-attach events
   }, 5000);
 });
 
@@ -68,10 +68,10 @@ bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP!");
 
   for (let i = 0; i < solanaCoins.length; i++) {
-    const symbol = solanaCoins[i];
-    const coin = symbol.replace("USDT", "");
+    const pair = solanaCoins[i];
+    const coin = pair.replace("/USD", "");
     const pollNumber = i + 1;
-    const price = prices[symbol] || "unknown";
+    const price = prices[pair] || "unknown";
 
     const question = "Degen Echo #" + pollNumber + " – $" + coin + " at $" + price + " – next 1H vibe?";
 
@@ -86,7 +86,7 @@ bot.command("poll", async (ctx) => {
   }
 });
 
-// /stake – stake into a specific poll's pot
+// /stake – simulate stake + rake
 bot.command("stake", (ctx) => {
   const args = ctx.message.text.split(" ");
   const amount = parseFloat(args[1]);
