@@ -1,18 +1,23 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Solana coins (Kraken symbols)
-const solanaCoins = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
-
-// Real-time prices
-const prices = {
-  "SOL/USD": "unknown",
-  "BONK/USD": "unknown",
-  "WIF/USD": "unknown",
-  "JUP/USD": "unknown"
+// Coin configs (Kraken, OKX, Bybit symbols)
+const coinConfigs = {
+  SOL: { kraken: "SOL/USD", okx: "SOL-USDT", bybit: "SOLUSDT" },
+  BONK: { kraken: "BONK/USD", okx: "BONK-USDT", bybit: "BONKUSDT" },
+  WIF: { kraken: "WIF/USD", okx: "WIF-USDT", bybit: "WIFUSDT" },
+  JUP: { kraken: "JUP/USD", okx: "JUP-USDT", bybit: "JUPUSDT" }
 };
 
-// Per-poll data (message ID → {coin, startPrice, pot: 0, stakes: [{userId, amount}]})
+// Real-time prices (updated by active WS)
+const prices = {
+  SOL: "unknown",
+  BONK: "unknown",
+  WIF: "unknown",
+  JUP: "unknown"
+};
+
+// Per-poll data (message ID → {coin, startPrice, pot: 0, stakes: []})
 const activePolls = {};
 
 // Rake & stake
@@ -22,98 +27,98 @@ const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 // Stagnate range
 const STAGNATE_RANGE = 0.5; // ±0.5%
 
-const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
-
-// WebSocket connections
-const wsConnections = {};
+// Current active exchange
 let currentExchange = "kraken";
 
-// Exchange configs
-const exchanges = {
-  kraken: {
-    url: "wss://ws.kraken.com",
-    subscribe: {
-      event: "subscribe",
-      pair: solanaCoins,
-      subscription: { name: "ticker" }
-    },
-    parse: (msg) => {
-      if (Array.isArray(msg) && msg[1] && msg[1].c) {
-        const pair = msg[3];
-        const coin = pair.replace("/USD", "");
-        prices[pair] = Number(msg[1].c[0]).toFixed(6);
+// WebSocket connection
+let ws = null;
+
+// Function to connect to current exchange
+function connectWS() {
+  const config = {
+    kraken: {
+      url: "wss://ws.kraken.com",
+      subscribe: {
+        event: "subscribe",
+        pair: Object.values(coinConfigs).map(c => c.kraken),
+        subscription: { name: "ticker" }
+      },
+      parse: (msg) => {
+        if (Array.isArray(msg) && msg[1] && msg[1].c) {
+          const pair = msg[3];
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].kraken === pair);
+          if (coin) prices[coin] = Number(msg[1].c[0]).toFixed(6);
+        }
       }
-    }
-  },
-  okx: {
-    url: "wss://ws.okx.com:8443/ws/v5/public",
-    subscribe: {
-      op: "subscribe",
-      args: solanaCoins.map(p => ({ channel: "tickers", instId: p.replace("/USD", "-USDT") }))
     },
-    parse: (msg) => {
-      if (msg.data && msg.arg && msg.arg.channel === "tickers") {
-        const instId = msg.arg.instId;
-        const coin = instId.replace("-USDT", "");
-        if (msg.data[0] && msg.data[0].last) {
-          prices[coin + "/USD"] = Number(msg.data[0].last).toFixed(6);
+    okx: {
+      url: "wss://ws.okx.com:8443/ws/v5/public",
+      subscribe: {
+        op: "subscribe",
+        args: Object.values(coinConfigs).map(c => ({ channel: "tickers", instId: c.okx }))
+      },
+      parse: (msg) => {
+        if (msg.data && msg.arg && msg.arg.channel === "tickers") {
+          const instId = msg.arg.instId;
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].okx === instId);
+          if (coin && msg.data[0] && msg.data[0].last) {
+            prices[coin] = Number(msg.data[0].last).toFixed(6);
+          }
+        }
+      }
+    },
+    bybit: {
+      url: "wss://stream.bybit.com/v5/public/spot",
+      subscribe: {
+        op: "subscribe",
+        args: Object.values(coinConfigs).map(c => "tickers." + c.bybit)
+      },
+      parse: (msg) => {
+        if (msg.topic && msg.data && msg.data.lastPrice) {
+          const symbol = msg.topic.split(".")[2];
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].bybit === symbol);
+          if (coin) prices[coin] = Number(msg.data.lastPrice).toFixed(6);
         }
       }
     }
-  },
-  bybit: {
-    url: "wss://stream.bybit.com/v5/public/spot",
-    subscribe: {
-      op: "subscribe",
-      args: Object.values(coins).map(c => "tickers." + c.bybit)
-    },
-    parse: (msg) => {
-      if (msg.topic && msg.data && msg.data.lastPrice) {
-        const symbol = msg.topic.split(".")[2];
-        const coin = Object.keys(coins).find(k => coins[k].bybit === symbol);
-        if (coin) prices[coin + "/USD"] = Number(msg.data.lastPrice).toFixed(6);
-      }
-    }
-  }
-};
+  };
 
-// Connect to current exchange
-function connectCurrentWS() {
-  const config = exchanges[currentExchange];
-  if (!config) return;
+  const currentConfig = config[currentExchange];
+  if (!currentConfig) return;
 
-  if (wsConnections[currentExchange]) wsConnections[currentExchange].close();
+  if (ws) ws.close();
 
-  const ws = new WebSocket(config.url);
-  wsConnections[currentExchange] = ws;
+  ws = new WebSocket(currentConfig.url);
 
   ws.on("open", () => {
     console.log(`${currentExchange} WebSocket connected`);
-    ws.send(JSON.stringify(config.subscribe));
+    ws.send(JSON.stringify(currentConfig.subscribe));
   });
 
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
-      config.parse(msg);
+      currentConfig.parse(msg);
     } catch (e) {
       console.error(`${currentExchange} parse error:`, e.message);
     }
   });
 
-  ws.on("error", (error) => console.error(`${currentExchange} WS error:`, error.message));
+  ws.on("error", (error) => {
+    console.error(`${currentExchange} WS error:`, error.message);
+  });
 
   ws.on("close", () => {
     console.log(`${currentExchange} WS closed – switching to next...`);
     const order = ["kraken", "okx", "bybit"];
     const currentIndex = order.indexOf(currentExchange);
     currentExchange = order[(currentIndex + 1) % order.length];
-    connectCurrentWS();
+    connectWS();
   });
 }
 
 // Start with Kraken
-connectCurrentWS();
+connectWS();
 
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
