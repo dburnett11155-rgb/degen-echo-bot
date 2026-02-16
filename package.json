@@ -1,19 +1,12 @@
 {
   "name": "degen-echo-bot",
   "version": "1.0.0",
-  "description": "Degen Echo Chamber Telegram bot with scraped real-time prices",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "telegraf": "^4.16.3",
-    "axios": "^1.7.2",
-    "cheerio": "^1.0.0-rc.12"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "author": "Donnie",
-  "license": "MIT"
+    "ws": "^8.18.0"
+  }
 }
