@@ -138,15 +138,37 @@ bot.on("callback_query", async (ctx) => {
 
   await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
 
-  const listener = bot.on("text", async (replyCtx) => {
-    if (replyCtx.from.id !== userId) return;
-    const amount = parseFloat(replyCtx.message.text.trim());
+// Scoped collector - listens ONLY for this user's next message
+const filter = m => m.author.id === userId;
+const collector = ctx.channel.createMessageCollector({ filter, max: 1, time: 60000 }); // 60-second timeout
 
-    if (!amount || amount <= 0) {
-      return replyCtx.reply("Invalid amount – try again");
-    }
+collector.on("collect", async m => {
+  const amount = parseFloat(m.content.trim());
 
-    const rake = amount * rakeRate;
+  if (!amount || amount <= 0) {
+    return m.reply("Invalid amount – try again");
+  }
+
+  const rake = amount * rakeRate;
+  pollData.pot += amount;
+  pollData.stakes.push({ userId: userId, amount, choice });
+
+  await ctx.telegram.editMessageText(
+    ctx.chat.id,
+    pollId,
+    undefined,
+    "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pair] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
+    { reply_markup: ctx.callbackQuery.message.reply_markup }
+  );
+
+  await m.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
+});
+
+collector.on("end", (collected, reason) => {
+  if (reason === "time") {
+    ctx.reply("Stake timed out – try again with /poll");
+  }
+});
     pollData.pot += amount;
     pollData.stakes.push({ userId, amount });
 
