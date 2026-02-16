@@ -151,6 +151,25 @@ bot.command("chaos", (ctx) => {
   }
 });
 
+// /cancel - allow users to cancel pending stakes
+bot.command("cancel", (ctx) => {
+  console.log("Cancel command received");
+  try {
+    const userId = ctx.from.id;
+    const chatId = ctx.chat.id;
+    const waitKey = chatId + "_" + userId;
+    
+    if (bot.context[waitKey]) {
+      delete bot.context[waitKey];
+      ctx.reply("❌ Your pending stake has been cancelled.");
+    } else {
+      ctx.reply("You don't have any pending stakes to cancel.");
+    }
+  } catch (error) {
+    console.error("Cancel command error:", error);
+  }
+});
+
 // Handle button tap
 bot.on("callback_query", async (ctx) => {
   console.log("Callback query received:", ctx.callbackQuery.data);
@@ -176,12 +195,21 @@ bot.on("callback_query", async (ctx) => {
 
     const userId = ctx.callbackQuery.from.id;
     const chatId = ctx.chat.id;
+    const waitKey = chatId + "_" + userId;
+
+    // Check if user already has a pending stake
+    if (bot.context[waitKey]) {
+      return ctx.answerCbQuery("⚠️ You already have a pending stake. Reply with amount or use /cancel");
+    }
 
     await ctx.answerCbQuery();
-    await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
+    await ctx.reply(
+      "💰 How much SOL do you want to stake on *" + choice + "* for poll #" + pollNumber + 
+      "?\n\nReply with amount (e.g. 0.001)\nOr use /cancel to abort",
+      { parse_mode: "Markdown" }
+    );
 
     // Store context for this user's next message
-    const waitKey = chatId + "_" + userId;
     bot.context[waitKey] = {
       pollId: pollId,
       pollData: pollData,
@@ -195,13 +223,21 @@ bot.on("callback_query", async (ctx) => {
     console.log("Context stored with key:", waitKey);
     console.log("Current bot.context keys:", Object.keys(bot.context));
 
-    // Auto-clear context after 5 minutes to prevent memory leaks
+    // Auto-clear context after 3 minutes with notification
     setTimeout(() => {
       if (bot.context[waitKey]) {
         console.log("Auto-clearing expired context for:", waitKey);
         delete bot.context[waitKey];
+        
+        // Notify user that their stake timed out
+        ctx.telegram.sendMessage(
+          chatId,
+          "⏱️ Your stake for poll #" + pollNumber + " has timed out. Tap the button again to try again."
+        ).catch((error) => {
+          console.error("Error sending timeout notification:", error.message);
+        });
       }
-    }, 300000);
+    }, 180000); // 3 minutes
 
   } catch (error) {
     console.error("Callback query error:", error);
@@ -226,6 +262,7 @@ bot.on("text", async (ctx) => {
     // Skip if no pending stake for this user
     if (!bot.context[waitKey]) {
       console.log("No pending stake for this user, ignoring message");
+      // Don't respond - let other handlers or commands process this message
       return;
     }
 
@@ -238,7 +275,16 @@ bot.on("text", async (ctx) => {
 
     if (isNaN(amount) || amount <= 0) {
       console.log("Invalid amount entered:", ctx.message.text);
-      return ctx.reply("Invalid amount – please enter a valid number greater than 0");
+      return ctx.reply(
+        "❌ Invalid amount – please tap the button again and enter a valid number greater than 0"
+      );
+    }
+
+    if (amount < 0.001) {
+      console.log("Amount too small:", amount);
+      return ctx.reply(
+        "❌ Minimum stake is 0.001 SOL. Please tap the button again to stake a higher amount."
+      );
     }
 
     console.log("Valid amount entered:", amount);
@@ -287,9 +333,10 @@ bot.on("text", async (ctx) => {
     console.log("Sending confirmation message");
 
     await ctx.reply(
-      "✅ Staked " + amount + " SOL on " + stakeData.choice + " for poll #" + stakeData.pollNumber + 
-      "!\n\nPot now: " + stakeData.pollData.pot.toFixed(6) + " SOL\nRake: " + rake.toFixed(6) + 
-      " SOL → " + rakeWallet
+      "✅ Staked " + amount + " SOL on *" + stakeData.choice + "* for poll #" + stakeData.pollNumber + 
+      "!\n\n💰 Pot now: " + stakeData.pollData.pot.toFixed(6) + " SOL\n" +
+      "📊 Rake (20%): " + rake.toFixed(6) + " SOL → " + rakeWallet,
+      { parse_mode: "Markdown" }
     );
 
     console.log("Stake processed successfully");
