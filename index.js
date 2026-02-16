@@ -153,11 +153,14 @@ bot.command("chaos", (ctx) => {
 
 // /cancel - allow users to cancel pending stakes
 bot.command("cancel", (ctx) => {
-  console.log("Cancel command received");
+  console.log("Cancel command received from user:", ctx.from.id);
   try {
     const userId = ctx.from.id;
     const chatId = ctx.chat.id;
     const waitKey = chatId + "_" + userId;
+    
+    console.log("Checking for context key:", waitKey);
+    console.log("Available keys:", Object.keys(bot.context));
     
     if (bot.context[waitKey]) {
       delete bot.context[waitKey];
@@ -173,6 +176,8 @@ bot.command("cancel", (ctx) => {
 // Handle button tap
 bot.on("callback_query", async (ctx) => {
   console.log("Callback query received:", ctx.callbackQuery.data);
+  console.log("From user:", ctx.callbackQuery.from.id, "in chat:", ctx.chat.id);
+  
   try {
     const data = ctx.callbackQuery.data;
     if (!data.startsWith("vote_")) {
@@ -199,14 +204,24 @@ bot.on("callback_query", async (ctx) => {
 
     // Check if user already has a pending stake
     if (bot.context[waitKey]) {
+      console.log("User already has pending stake");
       return ctx.answerCbQuery("⚠️ You already have a pending stake. Reply with amount or use /cancel");
     }
 
     await ctx.answerCbQuery();
-    await ctx.reply(
+    
+    // Send a message that requires reply - this helps in group chats
+    const promptMessage = await ctx.reply(
       "💰 How much SOL do you want to stake on *" + choice + "* for poll #" + pollNumber + 
-      "?\n\nReply with amount (e.g. 0.001)\nOr use /cancel to abort",
-      { parse_mode: "Markdown" }
+      "?\n\n⚡ Reply to this message with amount (e.g. 0.001)\n" +
+      "Or use /cancel to abort",
+      { 
+        parse_mode: "Markdown",
+        reply_markup: {
+          force_reply: true,
+          selective: true
+        }
+      }
     );
 
     // Store context for this user's next message
@@ -216,6 +231,7 @@ bot.on("callback_query", async (ctx) => {
       choice: choice,
       pollNumber: pollNumber,
       chatId: chatId,
+      promptMessageId: promptMessage.message_id,
       timestamp: Date.now()
     };
 
@@ -245,10 +261,18 @@ bot.on("callback_query", async (ctx) => {
   }
 });
 
-// Handle stake amount replies (MUST come after all commands)
-bot.on("text", async (ctx) => {
-  console.log("Text message received:", ctx.message.text);
+// Handle ALL messages (not just text) - this catches replies in groups
+bot.on("message", async (ctx) => {
+  // Skip if it's a command (those are handled separately)
+  if (ctx.message.text && ctx.message.text.startsWith("/")) {
+    console.log("Skipping command in message handler:", ctx.message.text);
+    return;
+  }
+
+  console.log("Message received:", ctx.message);
+  console.log("Text:", ctx.message.text);
   console.log("From user ID:", ctx.from.id, "in chat:", ctx.chat.id);
+  console.log("Reply to message:", ctx.message.reply_to_message ? ctx.message.reply_to_message.message_id : "none");
   
   try {
     const userId = ctx.from.id;
@@ -262,14 +286,25 @@ bot.on("text", async (ctx) => {
     // Skip if no pending stake for this user
     if (!bot.context[waitKey]) {
       console.log("No pending stake for this user, ignoring message");
-      // Don't respond - let other handlers or commands process this message
       return;
     }
 
+    // Check if this is a reply to our prompt (helps in group chats)
     const stakeData = bot.context[waitKey];
+    if (ctx.message.reply_to_message && 
+        ctx.message.reply_to_message.message_id !== stakeData.promptMessageId) {
+      console.log("Message is a reply to different message, ignoring");
+      return;
+    }
+
     delete bot.context[waitKey];
 
     console.log("Processing stake for poll #" + stakeData.pollNumber);
+
+    if (!ctx.message.text) {
+      console.log("No text in message");
+      return ctx.reply("❌ Please send a text message with the stake amount");
+    }
 
     const amount = parseFloat(ctx.message.text.trim());
 
@@ -342,7 +377,7 @@ bot.on("text", async (ctx) => {
     console.log("Stake processed successfully");
 
   } catch (error) {
-    console.error("Text handler error:", error);
+    console.error("Message handler error:", error);
     ctx.reply("Error processing your stake. Please try again.").catch(() => {});
   }
 });
@@ -360,9 +395,12 @@ process.once("SIGTERM", () => {
   if (ws) ws.close();
 });
 
-// Launch
-bot.launch().then(() => {
+// Launch with polling config for better group chat support
+bot.launch({
+  dropPendingUpdates: true
+}).then(() => {
   console.log("Degen Echo Bot is running");
+  console.log("Bot username: @" + bot.botInfo.username);
 }).catch((error) => {
   console.error("Failed to launch bot:", error);
   process.exit(1);
