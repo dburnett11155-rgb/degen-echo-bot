@@ -10,7 +10,7 @@ const connection = new Connection("https://api.mainnet-beta.solana.com", "confir
 // Pulse history (last 10 vectors [delta, tps, skips])
 let pulseHistory = [];
 
-// Anchor starting prices (current as of February 16, 2026)
+// Anchor starting prices (current real values as of February 16, 2026)
 const prices = {
   SOL: { value: "89.76", direction: "unknown" },
   BONK: { value: "0.00000642", direction: "unknown" },
@@ -21,12 +21,15 @@ const prices = {
 // Stagnate range
 const STAGNATE_RANGE = 0.5;
 
-// Per-poll data
+// Per-poll data (message ID → {coin, pot: 0, stakes: [{userId, amount, choice}]})
 const activePolls = {};
 
 // Rake
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
+
+const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
+
 // Update Solana Price Pulse every 10 seconds
 setInterval(async () => {
   try {
@@ -76,10 +79,10 @@ setInterval(async () => {
     console.error("SPP update failed:", e.message);
   }
 }, 10000);
-const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
+
 // /poll – creates 4 separate button polls with SPP prices
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
@@ -111,6 +114,7 @@ bot.command("poll", async (ctx) => {
     };
   }
 });
+
 // Handle button tap → ask for stake amount
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -139,7 +143,7 @@ bot.on("callback_query", async (ctx) => {
 
     const rake = amount * rakeRate;
     pollData.pot += amount;
-    pollData.stakes.push({ userId, amount });
+    pollData.stakes.push({ userId, amount, choice });
 
     // Edit poll message to show updated pot
     await ctx.telegram.editMessageText(
@@ -156,6 +160,7 @@ bot.on("callback_query", async (ctx) => {
     bot.off("text", listener);
   });
 });
+
 // /chaos – random score
 bot.command("chaos", (ctx) => {
   const score = Math.floor(Math.random() * 100) + 1;
