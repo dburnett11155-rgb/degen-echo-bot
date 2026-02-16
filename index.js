@@ -20,8 +20,8 @@ const prices = {
 };
 
 // Active polls and pending stakes - Each user tracked separately
-const activePolls = new Map(); // Key: message_id
-const pendingStakes = new Map(); // Key: userId
+const activePolls = new Map(); // Key: message_id (as string)
+const pendingStakes = new Map(); // Key: userId (as string)
 
 // Initialize bot
 const bot = new Telegraf(BOT_TOKEN);
@@ -181,8 +181,9 @@ bot.command("debug", ctx => {
   console.log("Active Polls:", activePolls.size);
   console.log("Pending Stakes:", pendingStakes.size);
   
+  // Log all pending stakes with details
   for (const [userId, value] of pendingStakes.entries()) {
-    console.log(`  User ${userId}: Poll #${value.pollNum}, ${value.choice}`);
+    console.log(`  User ${userId}: Poll #${value.pollNum}, ${value.choice}, username: ${value.username}`);
   }
   console.log("===================\n");
   
@@ -198,7 +199,7 @@ bot.command("debug", ctx => {
   if (pendingStakes.size > 0) {
     msg += `\n⏳ *Waiting for stakes from:*\n`;
     for (const [userId, value] of pendingStakes.entries()) {
-      msg += `• User ${userId} (Poll #${value.pollNum})\n`;
+      msg += `• ${value.username} (ID: ${userId}) - Poll #${value.pollNum}\n`;
     }
   }
   
@@ -230,7 +231,7 @@ bot.command("poll", async ctx => {
         reply_markup: getPollKeyboard(pollNum)
       });
 
-      activePolls.set(sent.message_id, {
+      activePolls.set(sent.message_id.toString(), {
         coin,
         pollNum,
         pot: 0,
@@ -272,9 +273,10 @@ bot.command("chaos", ctx => {
 
 // Command: /cancel
 bot.command("cancel", ctx => {
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username || ctx.from.first_name || "Anon";
   
-  console.log(`🚫 Cancel from user ${userId}`);
+  console.log(`🚫 Cancel from user ${username} (${userId})`);
   
   if (pendingStakes.has(userId)) {
     const stake = pendingStakes.get(userId);
@@ -287,28 +289,30 @@ bot.command("cancel", ctx => {
     );
     console.log(`✅ Cancelled for user ${userId}`);
   } else {
+    console.log(`❌ No pending stake found for user ${userId}`);
     ctx.reply("❌ You don't have any pending stakes");
   }
 });
 
 // Handle button clicks - Each user can have their own pending stake
 bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
-  console.log(`\n🔘 BUTTON from user ${ctx.from.id}`);
+  const userId = ctx.from.id.toString();
+  const username = ctx.from.username || ctx.from.first_name || "Anon";
+  
+  console.log(`\n🔘 BUTTON from user ${username} (${userId})`);
   
   const match = ctx.match;
   const pollNum = parseInt(match[1]);
   const choice = match[2];
-  const userId = ctx.from.id;
   const chatId = ctx.chat.id;
-  const username = ctx.from.username || ctx.from.first_name || "Anon";
   
   console.log(`Poll: ${pollNum}, Choice: ${choice}, User: ${username} (${userId})`);
   
-  const pollId = ctx.callbackQuery.message.message_id;
+  const pollId = ctx.callbackQuery.message.message_id.toString();
   const poll = activePolls.get(pollId);
   
   if (!poll) {
-    console.log(`❌ Poll not found!`);
+    console.log(`❌ Poll not found! pollId: ${pollId}`);
     return ctx.answerCbQuery("❌ Poll not found or expired");
   }
 
@@ -336,8 +340,15 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
   
   pendingStakes.set(userId, stakeInfo);
   
-  console.log(`✅ STORED for user ${userId} (${username})`);
-  console.log(`Total pending: ${pendingStakes.size}`);
+  console.log(`✅ STORED pending stake for user ${username} (${userId})`);
+  console.log(`Total pending stakes: ${pendingStakes.size}`);
+  console.log(`Pending stake details:`, {
+    userId,
+    username,
+    pollNum,
+    choice,
+    pollId
+  });
 
   await ctx.reply(
     `💰 *STAKE MODE ACTIVE* - @${username}\n\n` +
@@ -350,13 +361,13 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     { parse_mode: "Markdown" }
   );
 
-  console.log(`📤 Sent prompt to user ${userId}\n`);
+  console.log(`📤 Sent stake prompt to user ${username}\n`);
 
   // Auto-timeout after 3 minutes
   setTimeout(() => {
     if (pendingStakes.has(userId)) {
       const expiredStake = pendingStakes.get(userId);
-      console.log(`⌛ TIMEOUT for user ${userId}`);
+      console.log(`⌛ TIMEOUT for user ${username} (${userId})`);
       pendingStakes.delete(userId);
       ctx.telegram.sendMessage(
         chatId,
@@ -370,29 +381,53 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
 // Handle text messages - Each user's stake is tracked independently
 bot.on("text", async (ctx) => {
   const text = ctx.message.text.trim();
-  const userId = ctx.from.id;
+  const userId = ctx.from.id.toString(); // Convert to string for Map key
   const chatId = ctx.chat.id;
   const username = ctx.from.username || ctx.from.first_name || "Anon";
+  const messageId = ctx.message.message_id;
   
-  console.log(`\n📩 TEXT: "${text}" from ${username} (${userId})`);
+  console.log(`\n📩 TEXT MESSAGE RECEIVED`);
+  console.log(`From: ${username} (${userId})`);
+  console.log(`Message: "${text}"`);
+  console.log(`Message ID: ${messageId}`);
+  console.log(`Chat ID: ${chatId}`);
   
   // Skip commands
   if (text.startsWith("/")) {
-    console.log(`Skipping command`);
+    console.log(`Skipping command: ${text}`);
     return;
   }
 
-  console.log(`Looking for userId ${userId} in pending stakes...`);
-  console.log(`Pending stakes: ${pendingStakes.size}`);
-  console.log(`Has this user: ${pendingStakes.has(userId)}`);
+  console.log(`\n🔍 Checking pending stakes for user ${userId}...`);
+  console.log(`Total pending stakes in Map: ${pendingStakes.size}`);
+  
+  // Log all pending stake keys for debugging
+  if (pendingStakes.size > 0) {
+    console.log("Current pending stake keys:");
+    for (const [key, value] of pendingStakes.entries()) {
+      console.log(`  Key: "${key}" (type: ${typeof key}) - Username: ${value.username}, Poll: #${value.pollNum}`);
+    }
+  } else {
+    console.log("No pending stakes in Map");
+  }
 
   // Check if user has a pending stake
-  if (!pendingStakes.has(userId)) {
-    console.log(`❌ User ${userId} has no pending stake\n`);
+  const hasPending = pendingStakes.has(userId);
+  console.log(`Has pending stake for user ${userId}: ${hasPending}`);
+
+  if (!hasPending) {
+    console.log(`❌ User ${username} (${userId}) has no pending stake`);
     return;
   }
 
+  // Get the stake data
   const stakeData = pendingStakes.get(userId);
+  console.log(`✅ Found pending stake for ${username}:`, {
+    pollNum: stakeData.pollNum,
+    choice: stakeData.choice,
+    username: stakeData.username,
+    userId: stakeData.userId
+  });
   
   // Validate the stake amount
   const validation = validateStakeAmount(text);
@@ -416,6 +451,7 @@ bot.on("text", async (ctx) => {
   const amount = validation.amount;
   
   console.log(`✅ Valid amount: ${amount} SOL from ${username}`);
+  console.log(`Removed user ${userId} from pending stakes`);
 
   // Check if the poll still exists
   if (!stakeData.poll) {
@@ -462,7 +498,7 @@ bot.on("text", async (ctx) => {
   try {
     await ctx.telegram.editMessageText(
       stakeData.chatId,
-      stakeData.pollId,
+      parseInt(stakeData.pollId),
       undefined,
       updatedMsg,
       { 
@@ -473,7 +509,6 @@ bot.on("text", async (ctx) => {
     console.log(`✅ Poll updated with ${username}'s stake`);
   } catch (e) {
     console.error(`❌ Poll update error:`, e.message);
-    // If poll update fails, still confirm the stake to the user
   }
 
   // Send confirmation to the user
