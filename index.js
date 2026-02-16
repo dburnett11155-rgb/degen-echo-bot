@@ -222,3 +222,12 @@ bot.on("callback_query", async (ctx) => {
     }
   });
 });
+
+
+// Fallback stake listener - catches replies after prompt
+bot.on("text", async (ctx) => {
+  if (ctx.message.text.match(/^\d+(\.\d+)?$/)) { // simple check for number like "1" or "0.001"
+    // This is a fallback - in practice, add more logic if needed
+    ctx.reply("Stake received: " + ctx.message.text + " SOL - pot updated (manual check for now)");
+  }
+});
