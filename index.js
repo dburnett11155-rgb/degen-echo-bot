@@ -1,7 +1,7 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Global error handlers (prevents full crash)
+// Global error handling - prevents crashes
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
@@ -10,10 +10,8 @@ process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
 });
 
-// Solana coins
+// Solana coins & AscendEX symbols
 const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
-
-// AscendEX symbols
 const ascendexSymbols = ["SOL/USDT", "BONK/USDT", "WIF/USDT", "JUP/USDT"];
 
 // Real-time prices
@@ -41,9 +39,7 @@ ws.on("open", () => {
   ws.send(JSON.stringify({
     method: "sub.ticker",
     id: 1,
-    params: {
-      symbol: ascendexSymbols
-    }
+    params: { symbol: ascendexSymbols }
   }));
 });
 
@@ -119,7 +115,7 @@ bot.command("poll", async (ctx) => {
   }
 });
 
-// Handle button tap → ask for stake amount
+// Button tap
 bot.on("callback_query", async (ctx) => {
   try {
     const data = ctx.callbackQuery.data;
@@ -159,7 +155,7 @@ bot.on("callback_query", async (ctx) => {
 
         await replyCtx.reply(`Staked ${amount} SOL on \( {choice} for poll # \){pollNumber}! Pot now: ${pollData.pot.toFixed(6)} SOL (rake: ${rake.toFixed(6)})`);
       } catch (e) {
-        console.error("Stake listener error:", e.message);
+        console.error("Stake error:", e.message);
       }
       bot.off("text", listener);
     });
@@ -188,7 +184,7 @@ try {
   console.error("Bot launch error:", e.message);
 }
 
-// Keep process alive
+// Keep alive
 process.on('SIGINT', () => {
   bot.stop('SIGINT');
   process.exit(0);
