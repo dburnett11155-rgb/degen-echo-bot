@@ -1,5 +1,7 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
+const { Connection, PublicKey } = require("@solana/web3.js");
+const math = require("mathjs");
 
 // Solana coins (Kraken symbols)
 const solanaCoins = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
@@ -12,16 +14,56 @@ const prices = {
   "JUP/USD": "unknown"
 };
 
-// Per-poll data (poll message ID → {coin, pot: 0, stakes: []})
+// Per-poll data (message ID → {coin, pot: 0, stakes: []})
 const activePolls = {};
 
 // Rake & stake
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
-const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
+// Stagnate range
+const STAGNATE_RANGE = 0.5;
 
-// Connect to Kraken WebSocket
+// Solana RPC for SPP (pulse data)
+const connection = new Connection("https://api.mainnet-beta.solana.com");
+
+// Pulse vector history (for ML model)
+let pulseHistory = [];
+
+// Invented SPP: Track Solana pulse for price action
+async function updateSPP() {
+  try {
+    const block = await connection.getLatestBlockhash();
+    const tps = await connection.getRecentPerformanceSamples(1);
+    const delta = block.lastValidBlockHeight - block.blockHeight; // approximate block delta
+    const skips = tps[0].numSlots - tps[0].numTransactions; // approximate skips
+    const pulseVector = [delta, tps[0].numTransactions / tps[0].samplePeriodSecs, skips];
+
+    pulseHistory.push(pulseVector);
+    if (pulseHistory.length > 10) pulseHistory.shift(); // Keep last 10
+
+    // Simple AI model (linear regression on historical pulse vs price)
+    // Placeholder historical matrix (X = pulse, y = price change)
+    const X = math.matrix(pulseHistory);
+    const y = math.matrix([[0.2, -0.1, 0.0]]); // Placeholder y (replace with real historical data)
+    const theta = math.multiply(math.inv(math.multiply(math.transpose(X), X)), math.multiply(math.transpose(X), y)); // Theta = (X^T X)^-1 X^T y
+    const prediction = math.dot(pulseVector, theta.toArray()); // Predicted change
+
+    // Update prices with predicted change (anchor to last known)
+    for (const coin in prices) {
+      if (prices[coin] !== "unknown") {
+        prices[coin] = (Number(prices[coin]) + prediction).toFixed(6);
+      }
+    }
+  } catch (e) {
+    console.error("SPP update failed:", e.message);
+  }
+}
+
+// Run SPP update every 10s
+setInterval(updateSPP, 10000);
+
+// Connect to Kraken WebSocket (for initial prices)
 let ws = new WebSocket("wss://ws.kraken.com");
 
 ws.on("open", () => {
@@ -64,7 +106,7 @@ ws.on("close", () => {
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
 
-// /poll – creates 4 separate button polls with real-time Kraken prices
+// /poll – creates 4 separate button polls with real-time prices
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
