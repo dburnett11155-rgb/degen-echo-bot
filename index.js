@@ -1,7 +1,7 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Coin configs (Kraken, OKX, Bybit symbols)
+// Coin configs for each exchange
 const coinConfigs = {
   SOL: { kraken: "SOL/USD", okx: "SOL-USDT", bybit: "SOLUSDT" },
   BONK: { kraken: "BONK/USD", okx: "BONK-USDT", bybit: "BONKUSDT" },
@@ -17,15 +17,17 @@ const prices = {
   JUP: "unknown"
 };
 
-// Per-poll data
+// Per-poll data (message ID → {coin, startPrice, pot: 0, stakes: [{userId, amount, choice}]})
 const activePolls = {};
 
-// Rake
+// Rake & stagnate range
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
+const STAGNATE_RANGE = 0.5; // ±0.5%
 
-// Current exchange order
-const exchangeOrder = ["kraken", "okx", "bybit"];
+const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
+
+// Current exchange index (0 = kraken, 1 = okx, 2 = bybit)
 let currentExchangeIndex = 0;
 
 // Active WS
@@ -33,7 +35,7 @@ let ws = null;
 
 // Connect to current exchange
 function connectWS() {
-  const currentExchange = exchangeOrder[currentExchangeIndex];
+  const exchange = ["kraken", "okx", "bybit"][currentExchangeIndex];
   const config = {
     kraken: {
       url: "wss://ws.kraken.com",
@@ -82,7 +84,7 @@ function connectWS() {
     }
   };
 
-  const currentConfig = config[currentExchange];
+  const currentConfig = config[exchange];
   if (!currentConfig) return;
 
   if (ws) ws.close();
@@ -90,7 +92,7 @@ function connectWS() {
   ws = new WebSocket(currentConfig.url);
 
   ws.on("open", () => {
-    console.log(`${currentExchange} WebSocket connected`);
+    console.log(`${exchange} WebSocket connected`);
     ws.send(JSON.stringify(currentConfig.subscribe));
   });
 
@@ -99,22 +101,22 @@ function connectWS() {
       const msg = JSON.parse(data);
       currentConfig.parse(msg);
     } catch (e) {
-      console.error(`${currentExchange} parse error:`, e.message);
+      console.error(`${exchange} parse error:`, e.message);
     }
   });
 
   ws.on("error", (error) => {
-    console.error(`${currentExchange} WS error:`, error.message);
+    console.error(`${exchange} WS error:`, error.message);
   });
 
   ws.on("close", () => {
-    console.log(`${currentExchange} WS closed – switching to next...`);
-    currentExchangeIndex = (currentExchangeIndex + 1) % exchangeOrder.length;
+    console.log(`${exchange} WS closed – switching to next...`);
+    currentExchangeIndex = (currentExchangeIndex + 1) % 3; // Cycle through 3 exchanges
     connectWS();
   });
 }
 
-// Start with Kraken
+// Start connection
 connectWS();
 
 // /start
@@ -178,7 +180,7 @@ bot.on("callback_query", async (ctx) => {
 
     const rake = amount * rakeRate;
     pollData.pot += amount;
-    pollData.stakes.push({ userId, amount });
+    pollData.stakes.push({ userId, amount, choice });
 
     // Edit poll message to show updated pot
     await ctx.telegram.editMessageText(
