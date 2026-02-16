@@ -1,13 +1,5 @@
 const { Telegraf } = require("telegraf");
-const { Connection, PublicKey } = require("@solana/web3.js");
-
-// Your anchor prices (current as of February 16, 2026)
-const anchorPrices = {
-  SOL: 85.41,
-  BONK: 0.0000065,
-  WIF: 0.231,
-  JUP: 0.163
-};
+const { Connection } = require("@solana/web3.js");
 
 // Solana coins
 const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
@@ -18,26 +10,23 @@ const connection = new Connection("https://api.mainnet-beta.solana.com", "confir
 // Pulse history (last 10 vectors [delta, tps, skips])
 let pulseHistory = [];
 
-// Current pulse-derived prices and direction (start from anchors)
+// Anchor starting prices (current as of February 16, 2026)
 const prices = {
-  SOL: { value: anchorPrices.SOL.toFixed(2), direction: "unknown" },
-  BONK: { value: anchorPrices.BONK.toFixed(8), direction: "unknown" },
-  WIF: { value: anchorPrices.WIF.toFixed(3), direction: "unknown" },
-  JUP: { value: anchorPrices.JUP.toFixed(3), direction: "unknown" }
+  SOL: { value: "89.76", direction: "unknown" },
+  BONK: { value: "0.00000642", direction: "unknown" },
+  WIF: { value: "0.23", direction: "unknown" },
+  JUP: { value: "0.163", direction: "unknown" }
 };
 
 // Stagnate range
 const STAGNATE_RANGE = 0.5;
 
-// Per-poll data (message ID → {coin, pot: 0, stakes: []})
+// Per-poll data
 const activePolls = {};
 
 // Rake
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
-
-const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
-
 // Update Solana Price Pulse every 10 seconds
 setInterval(async () => {
   try {
@@ -69,13 +58,13 @@ setInterval(async () => {
         velocity = 0;
       } else if (avgTps > 1500 && avgDelta > 0.5) {
         direction = "Pump";
-        velocity = avgTps / 10000; // rough velocity proxy
+        velocity = avgTps / 10000;
       } else if (avgTps < 1000 || avgDelta > 1) {
         direction = "Dump";
         velocity = -avgTps / 10000;
       }
 
-      // Apply velocity to all prices nonstop
+      // Apply velocity to anchored prices nonstop
       for (const coin in prices) {
         const current = Number(prices[coin].value);
         const newPrice = current * (1 + velocity * 0.01);
@@ -87,10 +76,10 @@ setInterval(async () => {
     console.error("SPP update failed:", e.message);
   }
 }, 10000);
+const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
-
 // /poll – creates 4 separate button polls with SPP prices
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
@@ -122,7 +111,6 @@ bot.command("poll", async (ctx) => {
     };
   }
 });
-
 // Handle button tap → ask for stake amount
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -168,7 +156,6 @@ bot.on("callback_query", async (ctx) => {
     bot.off("text", listener);
   });
 });
-
 // /chaos – random score
 bot.command("chaos", (ctx) => {
   const score = Math.floor(Math.random() * 100) + 1;
