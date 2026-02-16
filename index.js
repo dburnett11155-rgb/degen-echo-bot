@@ -1,8 +1,7 @@
 const { Telegraf } = require("telegraf");
-const { Connection, PublicKey, LAMPORTS_PER_SOL, Transaction, SystemProgram } = require("@solana/web3.js");
+const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
 const WebSocket = require("ws");
 const express = require("express");
-const bs58 = require('bs58');
 
 // Configuration
 const BOT_TOKEN = "8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o";
@@ -14,7 +13,13 @@ const PORT = process.env.PORT || 3000;
 
 // Solana connection
 const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
-const connection = new Connection(SOLANA_RPC, "confirmed");
+let connection;
+try {
+  connection = new Connection(SOLANA_RPC, "confirmed");
+  console.log("✅ Solana connection established");
+} catch (error) {
+  console.error("❌ Failed to connect to Solana:", error.message);
+}
 
 // Special Telegram anonymous admin ID
 const ANONYMOUS_ADMIN_ID = "1087968824";
@@ -31,12 +36,18 @@ const prices = {
 };
 
 // Active polls and pending stakes
-const activePolls = new Map();
-const pendingStakes = new Map();
+const activePolls = new Map(); // Key: message_id
+const pendingStakes = new Map(); // Key: userIdentifier
 const userWallets = new Map(); // Store user wallet addresses
 
-// Initialize bot
+// Initialize bot with webhook cleanup
+console.log("🤖 Initializing bot...");
 const bot = new Telegraf(BOT_TOKEN);
+
+// Force clear any existing webhooks on startup
+bot.telegram.deleteWebhook({ drop_pending_updates: true })
+  .then(() => console.log("✅ Cleared any existing bot connections"))
+  .catch(err => console.log("No webhook to clear"));
 
 // Initialize Express app
 const app = express();
@@ -50,6 +61,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
+    solana: connection ? 'connected' : 'disconnected',
     activePolls: activePolls.size,
     pendingStakes: pendingStakes.size,
     registeredUsers: userWallets.size
@@ -73,6 +85,7 @@ function isValidSolanaAddress(address) {
 // Helper function to check SOL balance
 async function checkBalance(address) {
   try {
+    if (!connection) return 0;
     const publicKey = new PublicKey(address);
     const balance = await connection.getBalance(publicKey);
     return balance / LAMPORTS_PER_SOL;
@@ -126,44 +139,50 @@ function validateStakeAmount(input) {
 
 // WebSocket for price updates
 function connectPriceWebSocket() {
-  const ws = new WebSocket("wss://ws.kraken.com");
+  try {
+    const ws = new WebSocket("wss://ws.kraken.com");
 
-  ws.on("open", () => {
-    console.log("✅ Kraken WebSocket connected");
-    ws.send(JSON.stringify({
-      event: "subscribe",
-      pair: COINS,
-      subscription: { name: "ticker" }
-    }));
-  });
+    ws.on("open", () => {
+      console.log("✅ Kraken WebSocket connected");
+      ws.send(JSON.stringify({
+        event: "subscribe",
+        pair: COINS,
+        subscription: { name: "ticker" }
+      }));
+    });
 
-  ws.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data);
-      if (Array.isArray(msg) && msg[1] && msg[1].c) {
-        const pair = msg[3];
-        const price = msg[1].c[0];
-        if (COINS.includes(pair)) {
-          prices[pair] = Number(price).toFixed(6);
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data);
+        if (Array.isArray(msg) && msg[1] && msg[1].c) {
+          const pair = msg[3];
+          const price = msg[1].c[0];
+          if (COINS.includes(pair)) {
+            prices[pair] = Number(price).toFixed(6);
+          }
         }
+      } catch (e) {
+        console.error("WS parse error:", e.message);
       }
-    } catch (e) {
-      console.error("WS parse error:", e.message);
-    }
-  });
+    });
 
-  ws.on("error", (error) => {
-    console.error("WS error:", error.message);
-  });
+    ws.on("error", (error) => {
+      console.error("WS error:", error.message);
+    });
 
-  ws.on("close", () => {
-    console.log("WS closed - reconnecting in 5s...");
+    ws.on("close", () => {
+      console.log("WS closed - reconnecting in 5s...");
+      setTimeout(connectPriceWebSocket, 5000);
+    });
+
+    return ws;
+  } catch (error) {
+    console.error("Failed to connect WebSocket:", error);
     setTimeout(connectPriceWebSocket, 5000);
-  });
-
-  return ws;
+  }
 }
 
+// Start WebSocket connection
 connectPriceWebSocket();
 
 // Build poll message
@@ -230,7 +249,7 @@ bot.start(ctx => {
     "/debug - View bot status\n" +
     "/help - Show this message",
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 });
 
 // Command: /register
@@ -273,7 +292,7 @@ bot.command("register", async ctx => {
     `💰 *Balance:* ${balance.toFixed(6)} SOL\n\n` +
     `You can now place bets using /poll!`,
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 });
 
 // Command: /balance
@@ -299,7 +318,7 @@ bot.command("balance", async ctx => {
     `💎 *Balance:* ${balance.toFixed(6)} SOL\n\n` +
     `Minimum stake: ${MIN_STAKE} SOL`,
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 });
 
 // Command: /help
@@ -315,12 +334,13 @@ bot.help(ctx => {
     "/start - Welcome message\n" +
     "/help - Show this help",
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 });
 
 // Command: /debug
 bot.command("debug", ctx => {
   let msg = `📊 *Debug Info:*\n`;
+  msg += `Solana: ${connection ? '✅ Connected' : '❌ Disconnected'}\n`;
   msg += `Active Polls: ${activePolls.size}\n`;
   msg += `Pending Stakes: ${pendingStakes.size}\n`;
   msg += `Registered Users: ${userWallets.size}\n\n`;
@@ -337,7 +357,7 @@ bot.command("debug", ctx => {
     }
   }
   
-  ctx.reply(msg, { parse_mode: "Markdown" });
+  ctx.reply(msg, { parse_mode: "Markdown" }).catch(e => console.error("Reply error:", e));
 });
 
 // Command: /poll
@@ -375,19 +395,21 @@ bot.command("poll", async ctx => {
         reply_markup: getPollKeyboard(pollNum)
       });
 
-      activePolls.set(sent.message_id.toString(), {
-        coin,
-        pollNum,
-        pot: 0,
-        stakes: [],
-        chatId: ctx.chat.id,
-        messageId: sent.message_id,
-        createdAt: Date.now()
-      });
+      if (sent) {
+        activePolls.set(sent.message_id.toString(), {
+          coin,
+          pollNum,
+          pot: 0,
+          stakes: [],
+          chatId: ctx.chat.id,
+          messageId: sent.message_id,
+          createdAt: Date.now()
+        });
+      }
     }
   } catch (error) {
     console.error("Poll creation error:", error);
-    ctx.reply("❌ Error creating polls. Please try again.");
+    ctx.reply("❌ Error creating polls. Please try again.").catch(() => {});
   }
 });
 
@@ -411,7 +433,7 @@ bot.command("chaos", ctx => {
     `🎲 *Chaos Score:* ${score}/100\n` +
     `📊 *Vibe:* ${vibe} ${emoji}`,
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 });
 
 // Command: /cancel
@@ -427,9 +449,9 @@ bot.command("cancel", ctx => {
       `Poll #${stake.pollNum}\n` +
       `Choice: ${stake.choice.toUpperCase()}`,
       { parse_mode: "Markdown" }
-    );
+    ).catch(e => console.error("Reply error:", e));
   } else {
-    ctx.reply("❌ You don't have any pending stakes");
+    ctx.reply("❌ You don't have any pending stakes").catch(e => console.error("Reply error:", e));
   }
 });
 
@@ -493,7 +515,7 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     `⏱️ You have 3 minutes\n` +
     `❌ Use /cancel to abort`,
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 
   // Auto-timeout
   setTimeout(() => {
@@ -531,7 +553,7 @@ bot.on("text", async (ctx) => {
       `You sent: \`${text}\`\n` +
       `Please send a valid number. Your stake is still pending.`,
       { parse_mode: "Markdown" }
-    );
+    ).catch(e => console.error("Reply error:", e));
     return;
   }
 
@@ -575,7 +597,7 @@ bot.on("text", async (ctx) => {
   await ctx.reply(paymentMsg, {
     parse_mode: "Markdown",
     reply_markup: isAnonymous ? undefined : confirmKeyboard
-  });
+  }).catch(e => console.error("Reply error:", e));
 
   // Store pending payment
   pendingStakes.set(userIdentifier, {
@@ -604,7 +626,6 @@ bot.action(/^confirm_(\d+)_([\d.]+)$/, async (ctx) => {
   }
 
   // Here you would verify the transaction on Solana
-  // For now, we'll simulate confirmation
   console.log(`🔍 Verifying payment of ${amount} SOL from ${stakeData.username}`);
 
   // Add stake to poll
@@ -661,7 +682,7 @@ bot.action(/^confirm_(\d+)_([\d.]+)$/, async (ctx) => {
     `📊 *Total pot:* ${stakeData.poll.pot.toFixed(6)} SOL\n` +
     `👥 *Total players:* ${stakeData.poll.stakes.length}`,
     { parse_mode: "Markdown" }
-  );
+  ).catch(e => console.error("Reply error:", e));
 
   ctx.answerCbQuery("✅ Stake confirmed!");
 });
@@ -681,14 +702,19 @@ bot.catch((err, ctx) => {
 });
 
 // Launch bot
+console.log("🚀 Starting bot...");
 bot.launch({ dropPendingUpdates: true })
   .then(() => {
+    console.log("✅ Bot launched successfully!");
     console.log("🤖 Degen Echo Bot ONLINE");
-    console.log("✅ Solana integration enabled");
     console.log(`💰 Minimum stake: ${MIN_STAKE} SOL`);
-    console.log(`💸 Rake rate: ${RAKE_RATE * 100}%\n`);
+    console.log(`💸 Rake rate: ${RAKE_RATE * 100}%`);
+    if (connection) {
+      console.log("✅ Solana integration enabled");
+    } else {
+      console.log("⚠️ Solana integration disabled");
+    }
   })
   .catch(error => {
     console.error("💥 Launch failed:", error);
-    process.exit(1);
   });
