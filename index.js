@@ -1,32 +1,24 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Global error handling - prevents crashes
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+// Global error handling
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
 
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
 });
 
-// Solana coins
-const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
+// Solana coins (Kraken symbols)
+const solanaCoins = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
 
-// CoinCap asset IDs
-const assetIds = {
-  SOL: "solana",
-  BONK: "bonk-inu",
-  WIF: "dogwifhat",
-  JUP: "jupiter-exchange-solana"
-};
-
-// Real-time prices from CoinCap WS
+// Real-time prices
 const prices = {
-  SOL: "unknown",
-  BONK: "unknown",
-  WIF: "unknown",
-  JUP: "unknown"
+  "SOL/USD": "unknown",
+  "BONK/USD": "unknown",
+  "WIF/USD": "unknown",
+  "JUP/USD": "unknown"
 };
 
 // Poll storage
@@ -38,32 +30,39 @@ const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
 const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 
-// Connect to CoinCap WebSocket
-let ws = new WebSocket(`wss://ws.coincap.io/prices?assets=${Object.values(assetIds).join(',')}`);
+// Connect to Kraken WebSocket
+let ws = new WebSocket("wss://ws.kraken.com");
 
 ws.on("open", () => {
-  console.log("CoinCap WebSocket connected");
+  console.log("Kraken WS connected");
+  ws.send(JSON.stringify({
+    event: "subscribe",
+    pair: solanaCoins,
+    subscription: { name: "ticker" }
+  }));
 });
 
 ws.on("message", (data) => {
   try {
-    const msg = JSON.parse(data);
-    for (const [coin, assetId] of Object.entries(assetIds)) {
-      if (msg[assetId]) {
-        prices[coin] = Number(msg[assetId]).toFixed(coin === "BONK" ? 8 : 2);
+    const message = JSON.parse(data);
+    if (Array.isArray(message) && message[1] && message[1].c) {
+      const pair = message[3];
+      const price = message[1].c[0];
+      if (solanaCoins.includes(pair)) {
+        prices[pair] = Number(price).toFixed(6);
       }
     }
   } catch (e) {
-    console.error("CoinCap parse error:", e.message);
+    console.error("WS parse error:", e.message);
   }
 });
 
-ws.on("error", (error) => console.error("CoinCap WS error:", error.message));
+ws.on("error", (error) => console.error("Kraken WS error:", error.message));
 
 ws.on("close", () => {
-  console.log("CoinCap WS closed – reconnecting in 5s...");
+  console.log("Kraken WS closed – reconnecting in 5s...");
   setTimeout(() => {
-    ws = new WebSocket(`wss://ws.coincap.io/prices?assets=${Object.values(assetIds).join(',')}`);
+    ws = new WebSocket("wss://ws.kraken.com");
     ws.on("open", () => {});
     ws.on("message", (data) => {});
     ws.on("error", (error) => {});
@@ -71,25 +70,43 @@ ws.on("close", () => {
   }, 5000);
 });
 
+// Helper function to build poll message (no template literals - concatenation only)
+function buildPollMessage(pollNumber, coin, price) {
+  var part1 = "Degen Echo #";
+  var part2 = pollNumber.toString();
+  var part3 = " – $";
+  var part4 = coin;
+  var part5 = " at $";
+  var part6 = price;
+  var part7 = " – next 1H vibe?\nPot: 0 SOL";
+
+  return part1 + part2 + part3 + part4 + part5 + part6 + part7;
+}
+
 // /start
-bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
+bot.start((ctx) => {
+  ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)");
+});
 
 // /poll
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
   for (let i = 0; i < solanaCoins.length; i++) {
-    const coin = solanaCoins[i];
+    const pair = solanaCoins[i];
+    const coin = pair.replace("/USD", "");
     const pollNumber = i + 1;
-    const price = prices[coin] || "unknown";
+    const price = prices[pair] || "unknown";
 
-    const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
+    const pollText = buildPollMessage(pollNumber, coin, price);
+
+    const message = await ctx.reply(pollText, {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: "🚀 Pump", callback_data: `vote_${pollNumber}_pump` },
-            { text: "📉 Dump", callback_data: `vote_${pollNumber}_dump` },
-            { text: "🟡 Stagnate", callback_data: `vote_${pollNumber}_stagnate` }
+            { text: "🚀 Pump", callback_data: "vote_" + pollNumber + "_pump" },
+            { text: "📉 Dump", callback_data: "vote_" + pollNumber + "_dump" },
+            { text: "🟡 Stagnate", callback_data: "vote_" + pollNumber + "_stagnate" }
           ]
         ]
       }
@@ -104,13 +121,14 @@ bot.command("poll", async (ctx) => {
   }
 });
 
-// Handle button tap → ask for stake amount
+// Handle button tap
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
   if (!data.startsWith("vote_")) return;
 
-  const [_, pollNumberStr, choice] = data.split("_");
-  const pollNumber = parseInt(pollNumberStr);
+  const parts = data.split("_");
+  const pollNumber = parseInt(parts[1]);
+  const choice = parts[2];
   const pollId = ctx.callbackQuery.message.message_id;
   const pollData = activePolls[pollId];
 
@@ -118,7 +136,7 @@ bot.on("callback_query", async (ctx) => {
 
   const userId = ctx.callbackQuery.from.id;
 
-  await ctx.reply(`How much SOL do you want to stake on \( {choice} for poll # \){pollNumber}? Reply with amount (e.g. 0.001)`);
+  await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
 
   const listener = bot.on("text", async (replyCtx) => {
     if (replyCtx.from.id !== userId) return;
@@ -136,11 +154,11 @@ bot.on("callback_query", async (ctx) => {
       ctx.chat.id,
       pollId,
       undefined,
-      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pollData.coin + "/USD"] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
       { reply_markup: ctx.callbackQuery.message.reply_markup }
     );
 
-    await replyCtx.reply(`Staked ${amount} SOL on \( {choice} for poll # \){pollNumber}! Pot now: ${pollData.pot.toFixed(6)} SOL (rake: ${rake.toFixed(6)})`);
+    await replyCtx.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
     bot.off("text", listener);
   });
 });
@@ -149,7 +167,7 @@ bot.on("callback_query", async (ctx) => {
 bot.command("chaos", (ctx) => {
   const score = Math.floor(Math.random() * 100) + 1;
   const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
-  ctx.reply(`Chaos Score: ${score}/100 – Vibe: ${vibe}`);
+  ctx.reply("Chaos Score: " + score + "/100 – Vibe: " + vibe);
 });
 
 // Launch
