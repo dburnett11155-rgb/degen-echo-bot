@@ -4,8 +4,9 @@ const WebSocket = require("ws");
 // Configuration
 const BOT_TOKEN = "8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o";
 const RAKE_WALLET = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
-const RAKE_RATE = 0.2;
-const STAKE_TIMEOUT = 180000;
+const RAKE_RATE = 0.2; // 20%
+const STAKE_TIMEOUT = 180000; // 3 minutes
+const MIN_STAKE = 0.001; // Minimum SOL stake
 
 // Solana coins
 const COINS = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
@@ -19,11 +20,41 @@ const prices = {
 };
 
 // Active polls and pending stakes - Each user tracked separately
-const activePolls = new Map();
-const pendingStakes = new Map(); // Key is userId - allows multiple people to stake
+const activePolls = new Map(); // Key: message_id
+const pendingStakes = new Map(); // Key: userId
 
 // Initialize bot
 const bot = new Telegraf(BOT_TOKEN);
+
+// Helper function to validate stake amount
+function validateStakeAmount(input) {
+  // Remove any whitespace and replace comma with period
+  const cleaned = input.trim().replace(',', '.');
+  
+  // Check if it's a valid number format
+  if (!/^\d*\.?\d+$/.test(cleaned)) {
+    return { valid: false, error: "Invalid number format. Please use numbers only (e.g., 0.5)" };
+  }
+  
+  const amount = parseFloat(cleaned);
+  
+  if (isNaN(amount)) {
+    return { valid: false, error: "Not a valid number" };
+  }
+  
+  if (amount <= 0) {
+    return { valid: false, error: "Amount must be greater than 0" };
+  }
+  
+  if (amount < MIN_STAKE) {
+    return { valid: false, error: `Minimum stake is ${MIN_STAKE} SOL` };
+  }
+  
+  // Limit to 6 decimal places (SOL decimals)
+  const roundedAmount = Math.round(amount * 1000000) / 1000000;
+  
+  return { valid: true, amount: roundedAmount };
+}
 
 // WebSocket for price updates
 function connectPriceWebSocket() {
@@ -69,11 +100,11 @@ let ws = connectPriceWebSocket();
 
 // Helper: Build poll message
 function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
-  let msg = `🎰 Degen Echo #${pollNum} – $${coin} at $${price} – next 1H vibe?\n`;
-  msg += `💰 Pot: ${pot.toFixed(6)} SOL\n`;
+  let msg = `🎰 *Degen Echo #${pollNum}* – *$${coin}* at *$${price}* – next 1H vibe?\n`;
+  msg += `💰 *Pot:* ${pot.toFixed(6)} SOL\n`;
   
   if (stakes.length > 0) {
-    msg += `\n📊 Stakes:\n`;
+    msg += `\n📊 *Stakes:*\n`;
     const grouped = {};
     stakes.forEach(s => {
       if (!grouped[s.choice]) grouped[s.choice] = [];
@@ -83,13 +114,15 @@ function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
     for (const [choice, stakeList] of Object.entries(grouped)) {
       const emoji = choice === 'pump' ? '🚀' : choice === 'dump' ? '📉' : '🟡';
       const total = stakeList.reduce((sum, s) => sum + s.amount, 0);
-      msg += `${emoji} ${choice.toUpperCase()}: ${total.toFixed(6)} SOL (${stakeList.length} ${stakeList.length === 1 ? 'player' : 'players'})\n`;
+      msg += `${emoji} *${choice.toUpperCase()}*: ${total.toFixed(6)} SOL (${stakeList.length} ${stakeList.length === 1 ? 'player' : 'players'})\n`;
       
       // Show individual stakes
       stakeList.forEach(s => {
         msg += `  → ${s.username}: ${s.amount.toFixed(6)} SOL\n`;
       });
     }
+  } else {
+    msg += `\n❌ No stakes yet - Be the first to bet!`;
   }
   
   return msg;
@@ -110,13 +143,35 @@ function getPollKeyboard(pollNum) {
 bot.start(ctx => {
   console.log("▶️ Start from user", ctx.from.id);
   ctx.reply(
-    "🎰 Degen Echo Bot - Multi-Player Betting!\n\n" +
-    "📌 How to play:\n" +
+    "🎰 *Degen Echo Bot - Multi-Player Betting!*\n\n" +
+    "📌 *How to play:*\n" +
     "1️⃣ Use /poll to create prediction polls\n" +
     "2️⃣ Each player clicks a button to vote\n" +
     "3️⃣ Each player sends their stake amount\n" +
     "4️⃣ Multiple players can bet on same poll!\n\n" +
-    "Use /cancel to abort your pending stake"
+    "💰 *Rake:* 20% goes to the house wallet\n" +
+    "💎 *Min stake:* 0.001 SOL\n\n" +
+    "📋 *Commands:*\n" +
+    "/poll - Create new polls\n" +
+    "/cancel - Cancel your pending stake\n" +
+    "/chaos - Check market chaos score\n" +
+    "/debug - View bot status\n" +
+    "/help - Show this message",
+    { parse_mode: "Markdown" }
+  );
+});
+
+// Command: /help
+bot.help(ctx => {
+  ctx.reply(
+    "📋 *Available Commands:*\n\n" +
+    "/poll - Create 4 new prediction polls\n" +
+    "/cancel - Cancel your pending stake\n" +
+    "/chaos - Get random market chaos score\n" +
+    "/debug - View current bot status\n" +
+    "/start - Welcome message\n" +
+    "/help - Show this help",
+    { parse_mode: "Markdown" }
   );
 });
 
@@ -131,18 +186,23 @@ bot.command("debug", ctx => {
   }
   console.log("===================\n");
   
-  let msg = `📊 Debug Info:\n`;
+  let msg = `📊 *Debug Info:*\n`;
   msg += `Active Polls: ${activePolls.size}\n`;
   msg += `Pending Stakes: ${pendingStakes.size}\n\n`;
+  msg += `*Current Prices:*\n`;
+  
+  for (const [coin, price] of Object.entries(prices)) {
+    msg += `• ${coin}: $${price}\n`;
+  }
   
   if (pendingStakes.size > 0) {
-    msg += `Waiting for stakes from:\n`;
+    msg += `\n⏳ *Waiting for stakes from:*\n`;
     for (const [userId, value] of pendingStakes.entries()) {
-      msg += `• User ${userId}\n`;
+      msg += `• User ${userId} (Poll #${value.pollNum})\n`;
     }
   }
   
-  ctx.reply(msg);
+  ctx.reply(msg, { parse_mode: "Markdown" });
 });
 
 // Command: /poll
@@ -151,9 +211,11 @@ bot.command("poll", async ctx => {
   
   try {
     await ctx.reply(
-      "🚀 Creating 4 polls for SOL, BONK, WIF, JUP!\n\n" +
-      "👥 Everyone can vote and stake!\n" +
-      "👉 Click a button, then send your stake amount"
+      "🚀 *Creating 4 polls for SOL, BONK, WIF, JUP!*\n\n" +
+      "👥 *Everyone can vote and stake!*\n" +
+      "👉 Click a button, then send your stake amount\n" +
+      "💰 Minimum stake: 0.001 SOL",
+      { parse_mode: "Markdown" }
     );
 
     for (let i = 0; i < COINS.length; i++) {
@@ -164,6 +226,7 @@ bot.command("poll", async ctx => {
 
       const pollMsg = buildPollMessage(pollNum, coin, price, 0);
       const sent = await ctx.reply(pollMsg, {
+        parse_mode: "Markdown",
         reply_markup: getPollKeyboard(pollNum)
       });
 
@@ -172,22 +235,39 @@ bot.command("poll", async ctx => {
         pollNum,
         pot: 0,
         stakes: [],
-        chatId: ctx.chat.id
+        chatId: ctx.chat.id,
+        messageId: sent.message_id
       });
 
       console.log(`✅ Poll #${pollNum}, msgId: ${sent.message_id}`);
     }
   } catch (error) {
     console.error("Poll creation error:", error);
-    ctx.reply("❌ Error creating polls").catch(() => {});
+    ctx.reply("❌ Error creating polls. Please try again.").catch(() => {});
   }
 });
 
 // Command: /chaos
 bot.command("chaos", ctx => {
   const score = Math.floor(Math.random() * 100) + 1;
-  const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
-  ctx.reply(`🎲 Chaos Score: ${score}/100 – ${vibe}`);
+  let vibe, emoji;
+  
+  if (score > 70) {
+    vibe = "bullish";
+    emoji = "🔥";
+  } else if (score < 30) {
+    vibe = "bearish";
+    emoji = "💀";
+  } else {
+    vibe = "neutral";
+    emoji = "🤷";
+  }
+  
+  ctx.reply(
+    `🎲 *Chaos Score:* ${score}/100\n` +
+    `📊 *Vibe:* ${vibe} ${emoji}`,
+    { parse_mode: "Markdown" }
+  );
 });
 
 // Command: /cancel
@@ -199,7 +279,12 @@ bot.command("cancel", ctx => {
   if (pendingStakes.has(userId)) {
     const stake = pendingStakes.get(userId);
     pendingStakes.delete(userId);
-    ctx.reply(`✅ Cancelled your pending stake for poll #${stake.pollNum}`);
+    ctx.reply(
+      `✅ *Cancelled your pending stake*\n\n` +
+      `Poll #${stake.pollNum}\n` +
+      `Choice: ${stake.choice.toUpperCase()}`,
+      { parse_mode: "Markdown" }
+    );
     console.log(`✅ Cancelled for user ${userId}`);
   } else {
     ctx.reply("❌ You don't have any pending stakes");
@@ -224,7 +309,7 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
   
   if (!poll) {
     console.log(`❌ Poll not found!`);
-    return ctx.answerCbQuery("❌ Poll not found");
+    return ctx.answerCbQuery("❌ Poll not found or expired");
   }
 
   // Check if THIS user already has a pending stake
@@ -236,7 +321,7 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     );
   }
 
-  await ctx.answerCbQuery(`✅ Stake mode activated for ${choice.toUpperCase()}!`);
+  await ctx.answerCbQuery(`✅ Selected ${choice.toUpperCase()}! Now send your stake amount.`);
 
   const stakeInfo = {
     pollId,
@@ -245,6 +330,7 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     pollNum,
     chatId,
     username,
+    userId,
     timestamp: Date.now()
   };
   
@@ -253,13 +339,14 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
   console.log(`✅ STORED for user ${userId} (${username})`);
   console.log(`Total pending: ${pendingStakes.size}`);
 
-  const prompt = await ctx.reply(
+  await ctx.reply(
     `💰 *STAKE MODE ACTIVE* - @${username}\n\n` +
-    `Poll #${pollNum}: ${choice.toUpperCase()}\n` +
-    `Send your stake amount in SOL (min: 0.001)\n\n` +
-    `Example: 0.5\n` +
+    `📌 *Poll #${pollNum}:* ${choice.toUpperCase()}\n` +
+    `💎 *Minimum stake:* ${MIN_STAKE} SOL\n\n` +
+    `✍️ *Send your stake amount now*\n` +
+    `Example: \`0.5\` or \`1.23\`\n\n` +
     `⏱️ You have 3 minutes\n` +
-    `Use /cancel to abort`,
+    `❌ Use /cancel to abort`,
     { parse_mode: "Markdown" }
   );
 
@@ -268,11 +355,13 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
   // Auto-timeout after 3 minutes
   setTimeout(() => {
     if (pendingStakes.has(userId)) {
+      const expiredStake = pendingStakes.get(userId);
       console.log(`⌛ TIMEOUT for user ${userId}`);
       pendingStakes.delete(userId);
       ctx.telegram.sendMessage(
         chatId,
-        `⏱️ @${username} - Stake timeout for poll #${pollNum}. Click button to retry.`
+        `⏱️ @${username} - *Stake timeout* for poll #${pollNum}. Click button to try again.`,
+        { parse_mode: "Markdown" }
       ).catch(e => console.error("Timeout error:", e));
     }
   }, STAKE_TIMEOUT);
@@ -280,13 +369,14 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
 
 // Handle text messages - Each user's stake is tracked independently
 bot.on("text", async (ctx) => {
-  const text = ctx.message.text;
+  const text = ctx.message.text.trim();
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
   const username = ctx.from.username || ctx.from.first_name || "Anon";
   
   console.log(`\n📩 TEXT: "${text}" from ${username} (${userId})`);
   
+  // Skip commands
   if (text.startsWith("/")) {
     console.log(`Skipping command`);
     return;
@@ -296,51 +386,70 @@ bot.on("text", async (ctx) => {
   console.log(`Pending stakes: ${pendingStakes.size}`);
   console.log(`Has this user: ${pendingStakes.has(userId)}`);
 
+  // Check if user has a pending stake
   if (!pendingStakes.has(userId)) {
     console.log(`❌ User ${userId} has no pending stake\n`);
     return;
   }
 
   const stakeData = pendingStakes.get(userId);
-  pendingStakes.delete(userId);
   
-  console.log(`✅ Found stake for ${username} - Poll #${stakeData.pollNum}`);
+  // Validate the stake amount
+  const validation = validateStakeAmount(text);
+  
+  if (!validation.valid) {
+    console.log(`❌ Invalid amount from ${username}: "${text}" - ${validation.error}`);
+    
+    // Keep the pending stake - user can try again
+    await ctx.reply(
+      `❌ @${username} - *${validation.error}*\n\n` +
+      `You sent: \`${text}\`\n` +
+      `Please send a valid number (e.g., \`0.5\` or \`1.23\`)\n` +
+      `Your stake is still pending. Try again!`,
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
 
-  const amount = parseFloat(text.trim());
+  // Amount is valid - remove from pending
+  pendingStakes.delete(userId);
+  const amount = validation.amount;
+  
+  console.log(`✅ Valid amount: ${amount} SOL from ${username}`);
 
-  if (isNaN(amount) || amount <= 0) {
-    console.log(`❌ Invalid amount from ${username}`);
+  // Check if the poll still exists
+  if (!stakeData.poll) {
+    console.log(`❌ Poll not found for ${username}`);
     return ctx.reply(
-      `❌ @${username} - Invalid amount: "${text}"\n\n` +
-      `Click button again to retry.`
+      `❌ @${username} - Sorry, the poll no longer exists.\n` +
+      `Please create a new poll with /poll`,
+      { parse_mode: "Markdown" }
     );
   }
 
-  if (amount < 0.001) {
-    console.log(`❌ Amount too small from ${username}`);
-    return ctx.reply(`❌ @${username} - Minimum stake: 0.001 SOL`);
-  }
-
-  console.log(`✅ Valid: ${amount} SOL from ${username}`);
-
+  // Calculate rake and net amount
   const rake = amount * RAKE_RATE;
   const netAmount = amount - rake;
 
+  // Add the stake to the poll
   stakeData.poll.pot += netAmount;
   stakeData.poll.stakes.push({
     userId,
     amount: netAmount,
     choice: stakeData.choice,
-    username: stakeData.username
+    username: stakeData.username,
+    timestamp: Date.now()
   });
 
-  console.log(`💰 ${username} added ${netAmount.toFixed(6)} SOL`);
+  console.log(`💰 ${username} added ${netAmount.toFixed(6)} SOL (gross: ${amount} SOL, rake: ${rake.toFixed(6)} SOL)`);
   console.log(`💰 Total pot: ${stakeData.poll.pot.toFixed(6)} SOL`);
   console.log(`📊 Total players: ${stakeData.poll.stakes.length}`);
 
+  // Get current price
   const coinPair = stakeData.poll.coin + "/USD";
   const currentPrice = prices[coinPair] || "unknown";
   
+  // Build updated poll message
   const updatedMsg = buildPollMessage(
     stakeData.poll.pollNum,
     stakeData.poll.coin,
@@ -349,32 +458,45 @@ bot.on("text", async (ctx) => {
     stakeData.poll.stakes
   );
 
+  // Update the poll message
   try {
     await ctx.telegram.editMessageText(
       stakeData.chatId,
       stakeData.pollId,
       undefined,
       updatedMsg,
-      { reply_markup: getPollKeyboard(stakeData.poll.pollNum) }
+      { 
+        parse_mode: "Markdown",
+        reply_markup: getPollKeyboard(stakeData.poll.pollNum) 
+      }
     );
     console.log(`✅ Poll updated with ${username}'s stake`);
   } catch (e) {
-    console.error(`❌ Update error:`, e.message);
+    console.error(`❌ Poll update error:`, e.message);
+    // If poll update fails, still confirm the stake to the user
   }
 
+  // Send confirmation to the user
   await ctx.reply(
     `✅ *STAKE CONFIRMED* - @${username}\n\n` +
-    `Amount: ${amount} SOL\n` +
-    `Choice: ${stakeData.choice.toUpperCase()}\n` +
-    `Poll: #${stakeData.pollNum}\n\n` +
-    `💰 Your net stake: ${netAmount.toFixed(6)} SOL\n` +
-    `📊 Total pot: ${stakeData.poll.pot.toFixed(6)} SOL\n` +
-    `👥 Total players: ${stakeData.poll.stakes.length}\n` +
-    `💸 Rake (20%): ${rake.toFixed(6)} SOL → ||${RAKE_WALLET}||`,
+    `💰 *Amount:* ${amount.toFixed(6)} SOL\n` +
+    `📈 *Choice:* ${stakeData.choice.toUpperCase()}\n` +
+    `🎯 *Poll:* #${stakeData.pollNum}\n\n` +
+    `💎 *Your net stake:* ${netAmount.toFixed(6)} SOL\n` +
+    `💸 *Rake (20%):* ${rake.toFixed(6)} SOL\n` +
+    `🏦 *Rake wallet:* \`${RAKE_WALLET}\`\n\n` +
+    `📊 *Total pot:* ${stakeData.poll.pot.toFixed(6)} SOL\n` +
+    `👥 *Total players:* ${stakeData.poll.stakes.length}`,
     { parse_mode: "Markdown" }
   );
 
   console.log(`🎉 STAKE COMPLETE for ${username}!\n`);
+});
+
+// Handle errors
+bot.catch((err, ctx) => {
+  console.error(`❌ Bot error for ${ctx.updateType}:`, err);
+  ctx.reply("⚠️ An error occurred. Please try again.").catch(() => {});
 });
 
 // Graceful shutdown
@@ -387,12 +509,14 @@ bot.on("text", async (ctx) => {
   });
 });
 
-// Launch
+// Launch bot
 bot.launch({ dropPendingUpdates: true })
   .then(() => {
     console.log("🤖 Degen Echo Bot ONLINE - Multi-Player Mode");
     console.log(`📱 @${bot.botInfo.username}`);
-    console.log("✅ Multiple users can stake on same polls\n");
+    console.log("✅ Multiple users can stake on same polls");
+    console.log(`💰 Minimum stake: ${MIN_STAKE} SOL`);
+    console.log(`💸 Rake rate: ${RAKE_RATE * 100}%\n`);
   })
   .catch(error => {
     console.error("💥 Launch failed:", error);
