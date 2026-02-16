@@ -1,54 +1,67 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-const solanaCoins = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
-
-const prices = {
-  "SOL/USD": "unknown",
-  "BONK/USD": "unknown",
-  "WIF/USD": "unknown",
-  "JUP/USD": "unknown"
+// Coins (AscendEX symbols)
+const coins = {
+  SOL: "SOL/USDT",
+  BONK: "BONK/USDT",
+  WIF: "WIF/USDT",
+  JUP: "JUP/USDT"
 };
 
+// Real-time prices
+const prices = {
+  SOL: "unknown",
+  BONK: "unknown",
+  WIF: "unknown",
+  JUP: "unknown"
+};
+
+// Poll storage
 const activePolls = {};
 
+// Rake
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
 const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 
-let ws = new WebSocket("wss://ws.kraken.com");
+// Connect to AscendEX WS
+let ws = new WebSocket("wss://ascendex.com/0/api/pro/v1/stream");
 
 ws.on("open", () => {
-  console.log("Kraken WebSocket connected");
+  console.log("AscendEX WS connected");
+  // Subscribe to tickers
   ws.send(JSON.stringify({
-    event: "subscribe",
-    pair: solanaCoins,
-    subscription: { name: "ticker" }
+    method: "sub.ticker",
+    id: 1,
+    params: {
+      symbol: Object.values(coins)
+    }
   }));
 });
 
 ws.on("message", (data) => {
   try {
-    const message = JSON.parse(data);
-    if (Array.isArray(message) && message[1] && message[1].c) {
-      const pair = message[3];
-      const price = message[1].c[0];
-      if (solanaCoins.includes(pair)) {
-        prices[pair] = Number(price).toFixed(6);
+    const msg = JSON.parse(data);
+    if (msg.m === "ticker" && msg.data && msg.data.symbol) {
+      const symbol = msg.data.symbol;
+      const coin = Object.keys(coins).find(k => coins[k] === symbol);
+      if (coin && msg.data.close) {
+        prices[coin] = Number(msg.data.close).toFixed(coin === "BONK" ? 8 : 2);
       }
     }
   } catch (e) {
-    console.error("WebSocket parse error:", e.message);
+    console.error("AscendEX parse error:", e.message);
   }
 });
 
-ws.on("error", (error) => console.error("Kraken WS error:", error.message));
+ws.on("error", (error) => console.error("AscendEX WS error:", error.message));
 
 ws.on("close", () => {
-  console.log("Kraken WS closed - reconnecting in 5s...");
+  console.log("AscendEX WS closed – reconnecting in 5s...");
   setTimeout(() => {
-    ws = new WebSocket("wss://ws.kraken.com");
+    ws = new WebSocket("wss://ascendex.com/0/api/pro/v1/stream");
     ws.on("open", () => {});
     ws.on("message", (data) => {});
     ws.on("error", (error) => {});
@@ -56,16 +69,17 @@ ws.on("close", () => {
   }, 5000);
 });
 
+// /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
 
+// /poll
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
   for (let i = 0; i < solanaCoins.length; i++) {
-    const pair = solanaCoins[i];
-    const coin = pair.replace("/USD", "");
+    const coin = solanaCoins[i];
     const pollNumber = i + 1;
-    const price = prices[pair] || "unknown";
+    const price = prices[coin] || "unknown";
 
     const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
       reply_markup: {
@@ -88,6 +102,7 @@ bot.command("poll", async (ctx) => {
   }
 });
 
+// Handle button tap → ask for stake amount
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
   if (!data.startsWith("vote_")) return;
@@ -119,7 +134,7 @@ bot.on("callback_query", async (ctx) => {
       ctx.chat.id,
       pollId,
       undefined,
-      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pair] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
       { reply_markup: ctx.callbackQuery.message.reply_markup }
     );
 
@@ -128,11 +143,13 @@ bot.on("callback_query", async (ctx) => {
   });
 });
 
+// /chaos
 bot.command("chaos", (ctx) => {
   const score = Math.floor(Math.random() * 100) + 1;
   const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
   ctx.reply(`Chaos Score: ${score}/100 – Vibe: ${vibe}`);
 });
 
+// Launch
 bot.launch();
 console.log("Degen Echo Bot is running");
