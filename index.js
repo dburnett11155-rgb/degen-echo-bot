@@ -1,12 +1,13 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
+const { Connection, PublicKey } = require("@solana/web3.js");
 
-// Coin configs for each exchange
+// Solana coins (symbols for each exchange/RPC)
 const coinConfigs = {
-  SOL: { kraken: "SOL/USD", okx: "SOL-USDT", bybit: "SOLUSDT" },
-  BONK: { kraken: "BONK/USD", okx: "BONK-USDT", bybit: "BONKUSDT" },
-  WIF: { kraken: "WIF/USD", okx: "WIF-USDT", bybit: "WIFUSDT" },
-  JUP: { kraken: "JUP/USD", okx: "JUP-USDT", bybit: "JUPUSDT" }
+  SOL: { kraken: "SOL/USD", coingecko: "solana", solana: { poolId: "58oQChx4yWmvKdwLLZzBiLXAkJyqQcD4BXcRx4dg5Pc" } }, // Raydium SOL-USDC pool
+  BONK: { kraken: "BONK/USD", coingecko: "bonk1", solana: { poolId: "E6Gtmit8rcoApeefHJKfJRNoS3wAHzQEtgQqfkdHwTNs" } }, // BONK-USDC pool
+  WIF: { kraken: "WIF/USD", coingecko: "dogwifhat", solana: { poolId: "EKpQGSJtjMFqKZ9KQGPfgob1Q7iwsCwnO7Hc9ZXkB471" } }, // WIF-USDC pool
+  JUP: { kraken: "JUP/USD", coingecko: "jupiter-ag", solana: { poolId: "CLHLa1JLrDc3mWj3M8rA4kmR6ar9dp5wM3Yf99s87Qh4" } } // JUP-USDC pool
 };
 
 // Real-time prices
@@ -17,107 +18,108 @@ const prices = {
   JUP: "unknown"
 };
 
-// Per-poll data (message ID → {coin, startPrice, pot: 0, stakes: [{userId, amount, choice}]})
+// Per-poll data (message ID → {coin, startPrice, pot: 0, stakes: []})
 const activePolls = {};
 
-// Rake & stagnate range
+// Rake & stagnate
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
-const STAGNATE_RANGE = 0.5; // ±0.5%
+const STAGNATE_RANGE = 0.5;
 
-const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
+// Solana public RPC for on-chain backup
+const solanaConnection = new Connection("https://api.mainnet-beta.solana.com");
 
-// Current exchange index (0 = kraken, 1 = okx, 2 = bybit)
-let currentExchangeIndex = 0;
+// Current backup index (0 = kraken, 1 = coingecko, 2 = solana)
+let currentBackupIndex = 0;
 
-// Active WS
+// Active WS or RPC
 let ws = null;
 
-// Connect to current exchange
-function connectWS() {
-  const exchange = ["kraken", "okx", "bybit"][currentExchangeIndex];
-  const config = {
-    kraken: {
-      url: "wss://ws.kraken.com",
-      subscribe: {
-        event: "subscribe",
-        pair: Object.values(coinConfigs).map(c => c.kraken),
-        subscription: { name: "ticker" }
-      },
-      parse: (msg) => {
-        if (Array.isArray(msg) && msg[1] && msg[1].c) {
-          const pair = msg[3];
-          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].kraken === pair);
-          if (coin) prices[coin] = Number(msg[1].c[0]).toFixed(6);
-        }
-      }
-    },
-    okx: {
-      url: "wss://ws.okx.com:8443/ws/v5/public",
-      subscribe: {
-        op: "subscribe",
-        args: Object.values(coinConfigs).map(c => ({ channel: "tickers", instId: c.okx }))
-      },
-      parse: (msg) => {
-        if (msg.data && msg.arg && msg.arg.channel === "tickers") {
-          const instId = msg.arg.instId;
-          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].okx === instId);
-          if (coin && msg.data[0] && msg.data[0].last) {
-            prices[coin] = Number(msg.data[0].last).toFixed(6);
-          }
-        }
-      }
-    },
-    bybit: {
-      url: "wss://stream.bybit.com/v5/public/spot",
-      subscribe: {
-        op: "subscribe",
-        args: Object.values(coinConfigs).map(c => "tickers." + c.bybit)
-      },
-      parse: (msg) => {
-        if (msg.topic && msg.data && msg.data.lastPrice) {
-          const symbol = msg.topic.split(".")[2];
-          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].bybit === symbol);
-          if (coin) prices[coin] = Number(msg.data.lastPrice).toFixed(6);
-        }
-      }
-    }
-  };
-
-  const currentConfig = config[exchange];
-  if (!currentConfig) return;
+// Connect to current backup
+function connectBackup() {
+  const backups = ["kraken", "coingecko", "solana"];
+  const currentBackup = backups[currentBackupIndex];
 
   if (ws) ws.close();
 
-  ws = new WebSocket(currentConfig.url);
+  if (currentBackup === "kraken") {
+    ws = new WebSocket("wss://ws.kraken.com");
+    ws.on("open", () => {
+      console.log("Kraken WebSocket connected");
+      ws.send(JSON.stringify({
+        event: "subscribe",
+        pair: solanaCoins,
+        subscription: { name: "ticker" }
+      }));
+    });
 
-  ws.on("open", () => {
-    console.log(`${exchange} WebSocket connected`);
-    ws.send(JSON.stringify(currentConfig.subscribe));
-  });
+    ws.on("message", (data) => {
+      try {
+        const message = JSON.parse(data);
+        if (Array.isArray(message) && message[1] && message[1].c) {
+          const pair = message[3];
+          const coin = pair.replace("/USD", "");
+          prices[coin] = Number(message[1].c[0]).toFixed(6);
+        }
+      } catch (e) {
+        console.error("Kraken parse error:", e.message);
+      }
+    });
 
-  ws.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data);
-      currentConfig.parse(msg);
-    } catch (e) {
-      console.error(`${exchange} parse error:`, e.message);
-    }
-  });
+  } else if (currentBackup === "coingecko") {
+    ws = new WebSocket("wss://api.coingecko.com/api/v3/websocket");
+    ws.on("open", () => {
+      console.log("CoinGecko WebSocket connected");
+      ws.send(JSON.stringify({
+        type: "subscribe",
+        symbols: Object.values(coinConfigs).map(c => c.coingecko)
+      }));
+    });
+
+    ws.on("message", (data) => {
+      try {
+        const message = JSON.parse(data);
+        if (message.type === "price_update" && message.symbol && message.price) {
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].coingecko === message.symbol);
+          if (coin) prices[coin] = Number(message.price).toFixed(6);
+        }
+      } catch (e) {
+        console.error("CoinGecko parse error:", e.message);
+      }
+    });
+
+  } else if (currentBackup === "solana") {
+    // Solana RPC backup – fetch prices every 10s (not WebSocket)
+    console.log("Switched to Solana RPC backup");
+    setInterval(async () => {
+      for (const coin in coinConfigs) {
+        const poolId = coinConfigs[coin].solana.poolId;
+        try {
+          const account = await solanaConnection.getAccountInfo(new PublicKey(poolId));
+          // Simplified – parse pool data for price (real code needs AMM math)
+          // For now, placeholder (implement full if needed)
+          prices[coin] = "on-chain-price-placeholder"; // Replace with real calc
+        } catch (e) {
+          console.error("Solana RPC failed for " + coin + ": " + e.message);
+        }
+      }
+    }, 10000); // Update every 10s
+    return; // No WS for Solana backup
+  }
 
   ws.on("error", (error) => {
-    console.error(`${exchange} WS error:`, error.message);
+    console.error(`${currentBackup} WS error:`, error.message);
   });
 
   ws.on("close", () => {
-    console.log(`${exchange} WS closed – switching to next...`);
-    currentExchangeIndex = (currentExchangeIndex + 1) % 3; // Cycle through 3 exchanges
-    connectWS();
+    console.log(`${currentBackup} WS closed – switching to next backup...`);
+    currentBackupIndex = (currentBackupIndex + 1) % backups.length;
+    connectBackup();
   });
 }
 
-// Start connection
-connectWS();
+// Start with Kraken
+connectBackup();
 
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
@@ -180,7 +182,7 @@ bot.on("callback_query", async (ctx) => {
 
     const rake = amount * rakeRate;
     pollData.pot += amount;
-    pollData.stakes.push({ userId, amount, choice });
+    pollData.stakes.push({ userId, amount });
 
     // Edit poll message to show updated pot
     await ctx.telegram.editMessageText(
