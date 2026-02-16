@@ -121,34 +121,22 @@ bot.command("poll", async (ctx) => {
   }
 });
 
+// Simple vote confirmation - no staking
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
   if (!data.startsWith("vote_")) return;
 
   const [_, pollNumberStr, choice] = data.split("_");
   const pollNumber = parseInt(pollNumberStr);
-  const pollId = ctx.callbackQuery.message.message_id;
-  const pollData = activePolls[pollId];
 
-  if (!pollData) return ctx.answerCbQuery("Poll expired");
+  await ctx.answerCbQuery(`You voted \( {choice} for poll # \){pollNumber}!`);
 
-  const userId = ctx.callbackQuery.from.id;
-
-  await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
-
-  // Simple reply handler - checks next text message from this user
-  const tempListener = bot.on("text", async (replyCtx) => {
-    if (replyCtx.from.id !== userId) return;
-
-    const amount = parseFloat(replyCtx.message.text.trim());
-
-    if (!amount || amount <= 0) {
-      return replyCtx.reply("Invalid amount – try again");
-    }
-
-    const rake = amount * rakeRate;
-    pollData.pot += amount;
-    pollData.stakes.push({ userId: userId, amount, choice });
+  // Optional: show vote in poll message
+  await ctx.editMessageText(
+    ctx.callbackQuery.message.text + "\n\nYou voted: " + choice,
+    { reply_markup: ctx.callbackQuery.message.reply_markup }
+  );
+});
 
     await ctx.telegram.editMessageText(
       ctx.chat.id,
