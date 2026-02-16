@@ -30,6 +30,9 @@ const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
 const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 
+// Initialize context storage
+bot.context = {};
+
 // Connect to Kraken WebSocket
 let ws = new WebSocket("wss://ws.kraken.com");
 
@@ -121,49 +124,86 @@ bot.command("poll", async (ctx) => {
   }
 });
 
-// Simple vote confirmation - no staking
+// Handle button tap
 bot.on("callback_query", async (ctx) => {
-  const data = ctx.callbackQuery.data;
-  if (!data.startsWith("vote_")) return;
+  try {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith("vote_")) return;
 
-  const [_, pollNumberStr, choice] = data.split("_");
-  const pollNumber = parseInt(pollNumberStr);
+    const parts = data.split("_");
+    const pollNumber = parseInt(parts[1]);
+    const choice = parts[2];
+    const pollId = ctx.callbackQuery.message.message_id;
+    const pollData = activePolls[pollId];
 
-  await ctx.answerCbQuery(`You voted \( {choice} for poll # \){pollNumber}!`);
+    if (!pollData) return ctx.answerCbQuery("Poll expired");
 
-  // Optional: show vote in poll message
-  await ctx.editMessageText(
-    ctx.callbackQuery.message.text + "\n\nYou voted: " + choice,
-    { reply_markup: ctx.callbackQuery.message.reply_markup }
-  );
+    const userId = ctx.callbackQuery.from.id;
+    const chatId = ctx.chat.id;
+
+    await ctx.answerCbQuery();
+    await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
+
+    // Store context for this user's next message
+    const waitKey = chatId + "_" + userId;
+    bot.context[waitKey] = {
+      pollId: pollId,
+      pollData: pollData,
+      choice: choice,
+      pollNumber: pollNumber,
+      chatId: chatId
+    };
+
+  } catch (error) {
+    console.error("Callback query error:", error);
+    ctx.answerCbQuery("Error processing vote").catch(() => {});
+  }
 });
 
+// Handle stake amount replies
+bot.on("text", async (ctx) => {
+  try {
+    const userId = ctx.from.id;
+    const chatId = ctx.chat.id;
+    const waitKey = chatId + "_" + userId;
+
+    if (!bot.context[waitKey]) return;
+
+    const stakeData = bot.context[waitKey];
+    delete bot.context[waitKey];
+
+    const amount = parseFloat(ctx.message.text.trim());
+
+    if (!amount || amount <= 0) {
+      return ctx.reply("Invalid amount – try again");
+    }
+
+    const rake = amount * rakeRate;
+    stakeData.pollData.pot += amount;
+    stakeData.pollData.stakes.push({ userId: userId, amount: amount });
+
+    const coinPair = stakeData.pollData.coin + "/USD";
+    const currentPrice = prices[coinPair] || "unknown";
+    
+    const updatedText = "Degen Echo #" + stakeData.pollData.pollNumber + " – $" + stakeData.pollData.coin + " at $" + currentPrice + " – next 1H vibe?\nPot: " + stakeData.pollData.pot.toFixed(6) + " SOL";
+
     await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      pollId,
+      stakeData.chatId,
+      stakeData.pollId,
       undefined,
-      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pair] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
-      { reply_markup: ctx.callbackQuery.message.reply_markup }
+      updatedText,
+      { reply_markup: { inline_keyboard: [[
+        { text: "🚀 Pump", callback_data: "vote_" + stakeData.pollNumber + "_pump" },
+        { text: "📉 Dump", callback_data: "vote_" + stakeData.pollNumber + "_dump" },
+        { text: "🟡 Stagnate", callback_data: "vote_" + stakeData.pollNumber + "_stagnate" }
+      ]] }}
     );
 
-    await replyCtx.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
+    await ctx.reply("Staked " + amount + " SOL on " + stakeData.choice + " for poll #" + stakeData.pollNumber + "! Pot now: " + stakeData.pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
 
-    // Remove this listener after successful stake
-    bot.off("text", tempListener);
-  });
-});
-
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      pollId,
-      undefined,
-      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pollData.coin + "/USD"] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
-      { reply_markup: ctx.callbackQuery.message.reply_markup }
-    );
-
-    await replyCtx.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
-    bot.off("text", listener);
-  });
+  } catch (error) {
+    console.error("Text handler error:", error);
+  }
 });
 
 // /chaos
@@ -176,53 +216,3 @@ bot.command("chaos", (ctx) => {
 // Launch
 bot.launch();
 console.log("Degen Echo Bot is running");
-
-
-
-// Fallback stake collector - catches replies after prompt (added at end to avoid breaking anything)
-bot.on("callback_query", async (ctx) => {
-  const data = ctx.callbackQuery.data;
-  if (!data.startsWith("vote_")) return;
-
-  const [_, pollNumberStr, choice] = data.split("_");
-  const pollNumber = parseInt(pollNumberStr);
-  const pollId = ctx.callbackQuery.message.message_id;
-  const pollData = activePolls[pollId];
-
-  if (!pollData) return ctx.answerCbQuery("Poll expired");
-
-  const userId = ctx.callbackQuery.from.id;
-
-  await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
-
-  const filter = m => m.author.id === userId;
-  const collector = ctx.channel.createMessageCollector({ filter, max: 1, time: 60000 });
-
-  collector.on("collect", async m => {
-    const amount = parseFloat(m.content.trim());
-
-    if (!amount || amount <= 0) {
-      return m.reply("Invalid amount – try again");
-    }
-
-    const rake = amount * rakeRate;
-    pollData.pot += amount;
-    pollData.stakes.push({ userId: userId, amount, choice });
-
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      pollId,
-      undefined,
-      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pair] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
-      { reply_markup: ctx.callbackQuery.message.reply_markup }
-    );
-
-    await m.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
-  });
-
-  collector.on("end", (collected, reason) => {
-    if (reason === "time") {
-      ctx.reply("Stake timed out – try again with /poll");
-    }
-  });
-});
