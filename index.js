@@ -8,6 +8,9 @@ const RAKE_RATE = 0.2; // 20%
 const STAKE_TIMEOUT = 180000; // 3 minutes
 const MIN_STAKE = 0.001; // Minimum SOL stake
 
+// Special Telegram anonymous admin ID
+const ANONYMOUS_ADMIN_ID = "1087968824";
+
 // Solana coins
 const COINS = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
 
@@ -21,10 +24,26 @@ const prices = {
 
 // Active polls and pending stakes - Each user tracked separately
 const activePolls = new Map(); // Key: message_id (as string)
-const pendingStakes = new Map(); // Key: userId (as string)
+const pendingStakes = new Map(); // Key: unique user identifier
 
-// Initialize bot
-const bot = new Telegraf(BOT_TOKEN);
+// Helper function to get a unique user identifier
+function getUserIdentifier(ctx) {
+  const userId = ctx.from?.id?.toString();
+  const chatId = ctx.chat?.id?.toString();
+  
+  // If it's the anonymous admin, we need to use a combination of chat ID and sender chat
+  if (userId === ANONYMOUS_ADMIN_ID) {
+    // For anonymous admins, use the sender chat ID if available
+    if (ctx.from?.username) {
+      return `anon_${ctx.from.username}`;
+    }
+    // Fallback to chat ID + a timestamp component (less reliable but better than nothing)
+    return `anon_${chatId}_${Date.now().toString().slice(0, -3)}`;
+  }
+  
+  // Regular user - just use their ID
+  return userId;
+}
 
 // Helper function to validate stake amount
 function validateStakeAmount(input) {
@@ -118,7 +137,8 @@ function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
       
       // Show individual stakes
       stakeList.forEach(s => {
-        msg += `  → ${s.username}: ${s.amount.toFixed(6)} SOL\n`;
+        const displayName = s.username === "Anonymous" ? "Anonymous Admin" : s.username;
+        msg += `  → ${displayName}: ${s.amount.toFixed(6)} SOL\n`;
       });
     }
   } else {
@@ -141,7 +161,7 @@ function getPollKeyboard(pollNum) {
 
 // Command: /start
 bot.start(ctx => {
-  console.log("▶️ Start from user", ctx.from.id);
+  console.log("▶️ Start from user", ctx.from?.id);
   ctx.reply(
     "🎰 *Degen Echo Bot - Multi-Player Betting!*\n\n" +
     "📌 *How to play:*\n" +
@@ -208,7 +228,7 @@ bot.command("debug", ctx => {
 
 // Command: /poll
 bot.command("poll", async ctx => {
-  console.log("📊 Poll from user", ctx.from.id, "in chat", ctx.chat.id);
+  console.log("📊 Poll from user", ctx.from?.id, "in chat", ctx.chat?.id);
   
   try {
     await ctx.reply(
@@ -273,40 +293,41 @@ bot.command("chaos", ctx => {
 
 // Command: /cancel
 bot.command("cancel", ctx => {
-  const userId = ctx.from.id.toString();
-  const username = ctx.from.username || ctx.from.first_name || "Anon";
+  const userIdentifier = getUserIdentifier(ctx);
+  const username = ctx.from?.username || ctx.from?.first_name || "Anonymous";
   
-  console.log(`🚫 Cancel from user ${username} (${userId})`);
+  console.log(`🚫 Cancel from user ${username} (${userIdentifier})`);
   
-  if (pendingStakes.has(userId)) {
-    const stake = pendingStakes.get(userId);
-    pendingStakes.delete(userId);
+  if (pendingStakes.has(userIdentifier)) {
+    const stake = pendingStakes.get(userIdentifier);
+    pendingStakes.delete(userIdentifier);
     ctx.reply(
       `✅ *Cancelled your pending stake*\n\n` +
       `Poll #${stake.pollNum}\n` +
       `Choice: ${stake.choice.toUpperCase()}`,
       { parse_mode: "Markdown" }
     );
-    console.log(`✅ Cancelled for user ${userId}`);
+    console.log(`✅ Cancelled for user ${userIdentifier}`);
   } else {
-    console.log(`❌ No pending stake found for user ${userId}`);
+    console.log(`❌ No pending stake found for user ${userIdentifier}`);
     ctx.reply("❌ You don't have any pending stakes");
   }
 });
 
 // Handle button clicks - Each user can have their own pending stake
 bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
-  const userId = ctx.from.id.toString();
-  const username = ctx.from.username || ctx.from.first_name || "Anon";
+  const userIdentifier = getUserIdentifier(ctx);
+  const username = ctx.from?.username || ctx.from?.first_name || "Anonymous";
+  const isAnonymous = ctx.from?.id?.toString() === ANONYMOUS_ADMIN_ID;
   
-  console.log(`\n🔘 BUTTON from user ${username} (${userId})`);
+  console.log(`\n🔘 BUTTON from user ${username} (${userIdentifier}) ${isAnonymous ? '(Anonymous Admin)' : ''}`);
   
   const match = ctx.match;
   const pollNum = parseInt(match[1]);
   const choice = match[2];
   const chatId = ctx.chat.id;
   
-  console.log(`Poll: ${pollNum}, Choice: ${choice}, User: ${username} (${userId})`);
+  console.log(`Poll: ${pollNum}, Choice: ${choice}, User: ${username} (${userIdentifier})`);
   
   const pollId = ctx.callbackQuery.message.message_id.toString();
   const poll = activePolls.get(pollId);
@@ -317,9 +338,9 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
   }
 
   // Check if THIS user already has a pending stake
-  if (pendingStakes.has(userId)) {
-    const existing = pendingStakes.get(userId);
-    console.log(`⚠️ User ${userId} has pending stake for poll #${existing.pollNum}`);
+  if (pendingStakes.has(userIdentifier)) {
+    const existing = pendingStakes.get(userIdentifier);
+    console.log(`⚠️ User ${userIdentifier} has pending stake for poll #${existing.pollNum}`);
     return ctx.answerCbQuery(
       `⚠️ You have a pending stake for poll #${existing.pollNum}! Use /cancel first`
     );
@@ -333,31 +354,38 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     choice,
     pollNum,
     chatId,
-    username,
-    userId,
-    timestamp: Date.now()
+    username: isAnonymous ? "Anonymous Admin" : username,
+    userIdentifier,
+    timestamp: Date.now(),
+    isAnonymous
   };
   
-  pendingStakes.set(userId, stakeInfo);
+  pendingStakes.set(userIdentifier, stakeInfo);
   
-  console.log(`✅ STORED pending stake for user ${username} (${userId})`);
+  console.log(`✅ STORED pending stake for user ${username} (${userIdentifier})`);
   console.log(`Total pending stakes: ${pendingStakes.size}`);
   console.log(`Pending stake details:`, {
-    userId,
+    userIdentifier,
     username,
     pollNum,
     choice,
-    pollId
+    pollId,
+    isAnonymous
   });
 
+  // For anonymous users, give special instructions
+  const anonymousNote = isAnonymous ? 
+    "\n⚠️ *Note:* You're posting anonymously. Make sure to send your stake amount from this same anonymous session!" : "";
+  
   await ctx.reply(
-    `💰 *STAKE MODE ACTIVE* - @${username}\n\n` +
+    `💰 *STAKE MODE ACTIVE* - ${isAnonymous ? 'Anonymous Admin' : '@' + username}\n\n` +
     `📌 *Poll #${pollNum}:* ${choice.toUpperCase()}\n` +
     `💎 *Minimum stake:* ${MIN_STAKE} SOL\n\n` +
     `✍️ *Send your stake amount now*\n` +
     `Example: \`0.5\` or \`1.23\`\n\n` +
     `⏱️ You have 3 minutes\n` +
-    `❌ Use /cancel to abort`,
+    `❌ Use /cancel to abort` +
+    anonymousNote,
     { parse_mode: "Markdown" }
   );
 
@@ -365,13 +393,13 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
 
   // Auto-timeout after 3 minutes
   setTimeout(() => {
-    if (pendingStakes.has(userId)) {
-      const expiredStake = pendingStakes.get(userId);
-      console.log(`⌛ TIMEOUT for user ${username} (${userId})`);
-      pendingStakes.delete(userId);
+    if (pendingStakes.has(userIdentifier)) {
+      const expiredStake = pendingStakes.get(userIdentifier);
+      console.log(`⌛ TIMEOUT for user ${username} (${userIdentifier})`);
+      pendingStakes.delete(userIdentifier);
       ctx.telegram.sendMessage(
         chatId,
-        `⏱️ @${username} - *Stake timeout* for poll #${pollNum}. Click button to try again.`,
+        `⏱️ ${isAnonymous ? 'Anonymous Admin' : '@' + username} - *Stake timeout* for poll #${pollNum}. Click button to try again.`,
         { parse_mode: "Markdown" }
       ).catch(e => console.error("Timeout error:", e));
     }
@@ -381,13 +409,16 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
 // Handle text messages - Each user's stake is tracked independently
 bot.on("text", async (ctx) => {
   const text = ctx.message.text.trim();
-  const userId = ctx.from.id.toString(); // Convert to string for Map key
+  const userIdentifier = getUserIdentifier(ctx);
+  const userId = ctx.from?.id?.toString();
   const chatId = ctx.chat.id;
-  const username = ctx.from.username || ctx.from.first_name || "Anon";
+  const username = ctx.from?.username || ctx.from?.first_name || "Anonymous";
+  const isAnonymous = userId === ANONYMOUS_ADMIN_ID;
   const messageId = ctx.message.message_id;
   
   console.log(`\n📩 TEXT MESSAGE RECEIVED`);
-  console.log(`From: ${username} (${userId})`);
+  console.log(`From: ${username} (${userIdentifier}) ${isAnonymous ? '(Anonymous Admin)' : ''}`);
+  console.log(`Raw User ID: ${userId}`);
   console.log(`Message: "${text}"`);
   console.log(`Message ID: ${messageId}`);
   console.log(`Chat ID: ${chatId}`);
@@ -398,7 +429,7 @@ bot.on("text", async (ctx) => {
     return;
   }
 
-  console.log(`\n🔍 Checking pending stakes for user ${userId}...`);
+  console.log(`\n🔍 Checking pending stakes for user ${userIdentifier}...`);
   console.log(`Total pending stakes in Map: ${pendingStakes.size}`);
   
   // Log all pending stake keys for debugging
@@ -411,22 +442,32 @@ bot.on("text", async (ctx) => {
     console.log("No pending stakes in Map");
   }
 
-  // Check if user has a pending stake
-  const hasPending = pendingStakes.has(userId);
-  console.log(`Has pending stake for user ${userId}: ${hasPending}`);
+  // Check if user has a pending stake using their identifier
+  const hasPending = pendingStakes.has(userIdentifier);
+  console.log(`Has pending stake for user ${userIdentifier}: ${hasPending}`);
 
   if (!hasPending) {
-    console.log(`❌ User ${username} (${userId}) has no pending stake`);
+    console.log(`❌ User ${username} (${userIdentifier}) has no pending stake`);
+    
+    // Don't reply for anonymous users to avoid spam
+    if (!isAnonymous) {
+      await ctx.reply(
+        `❌ @${username} - You don't have any pending stake.\n\n` +
+        `Please click a button on a poll first to place a bet.`,
+        { parse_mode: "Markdown" }
+      );
+    }
     return;
   }
 
   // Get the stake data
-  const stakeData = pendingStakes.get(userId);
+  const stakeData = pendingStakes.get(userIdentifier);
   console.log(`✅ Found pending stake for ${username}:`, {
     pollNum: stakeData.pollNum,
     choice: stakeData.choice,
     username: stakeData.username,
-    userId: stakeData.userId
+    userIdentifier: stakeData.userIdentifier,
+    isAnonymous: stakeData.isAnonymous
   });
   
   // Validate the stake amount
@@ -437,7 +478,7 @@ bot.on("text", async (ctx) => {
     
     // Keep the pending stake - user can try again
     await ctx.reply(
-      `❌ @${username} - *${validation.error}*\n\n` +
+      `❌ ${stakeData.isAnonymous ? 'Anonymous Admin' : '@' + username} - *${validation.error}*\n\n` +
       `You sent: \`${text}\`\n` +
       `Please send a valid number (e.g., \`0.5\` or \`1.23\`)\n` +
       `Your stake is still pending. Try again!`,
@@ -447,17 +488,17 @@ bot.on("text", async (ctx) => {
   }
 
   // Amount is valid - remove from pending
-  pendingStakes.delete(userId);
+  pendingStakes.delete(userIdentifier);
   const amount = validation.amount;
   
   console.log(`✅ Valid amount: ${amount} SOL from ${username}`);
-  console.log(`Removed user ${userId} from pending stakes`);
+  console.log(`Removed user ${userIdentifier} from pending stakes`);
 
   // Check if the poll still exists
   if (!stakeData.poll) {
     console.log(`❌ Poll not found for ${username}`);
     return ctx.reply(
-      `❌ @${username} - Sorry, the poll no longer exists.\n` +
+      `❌ ${stakeData.isAnonymous ? 'Anonymous Admin' : '@' + username} - Sorry, the poll no longer exists.\n` +
       `Please create a new poll with /poll`,
       { parse_mode: "Markdown" }
     );
@@ -470,11 +511,12 @@ bot.on("text", async (ctx) => {
   // Add the stake to the poll
   stakeData.poll.pot += netAmount;
   stakeData.poll.stakes.push({
-    userId,
+    userIdentifier,
     amount: netAmount,
     choice: stakeData.choice,
     username: stakeData.username,
-    timestamp: Date.now()
+    timestamp: Date.now(),
+    isAnonymous: stakeData.isAnonymous
   });
 
   console.log(`💰 ${username} added ${netAmount.toFixed(6)} SOL (gross: ${amount} SOL, rake: ${rake.toFixed(6)} SOL)`);
@@ -512,8 +554,9 @@ bot.on("text", async (ctx) => {
   }
 
   // Send confirmation to the user
+  const displayName = stakeData.isAnonymous ? "Anonymous Admin" : '@' + username;
   await ctx.reply(
-    `✅ *STAKE CONFIRMED* - @${username}\n\n` +
+    `✅ *STAKE CONFIRMED* - ${displayName}\n\n` +
     `💰 *Amount:* ${amount.toFixed(6)} SOL\n` +
     `📈 *Choice:* ${stakeData.choice.toUpperCase()}\n` +
     `🎯 *Poll:* #${stakeData.pollNum}\n\n` +
@@ -552,6 +595,7 @@ bot.launch({ dropPendingUpdates: true })
     console.log("✅ Multiple users can stake on same polls");
     console.log(`💰 Minimum stake: ${MIN_STAKE} SOL`);
     console.log(`💸 Rake rate: ${RAKE_RATE * 100}%\n`);
+    console.log("👤 Anonymous admin support enabled");
   })
   .catch(error => {
     console.error("💥 Launch failed:", error);
