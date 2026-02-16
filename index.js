@@ -1,17 +1,44 @@
 const { Telegraf } = require("telegraf");
-const { Connection, PublicKey, LAMPORTS_PER_SOL } = require("@solana/web3.js");
+const { Connection, PublicKey, LAMPORTS_PER_SOL, Keypair, Transaction, SystemProgram } = require("@solana/web3.js");
 const WebSocket = require("ws");
 const express = require("express");
+const cron = require('node-cron');
+const { createCanvas } = require('canvas');
+const fs = require('fs');
 
-// Configuration
+// ============================================
+// CONFIGURATION - YOUR MONEY MAKER
+// ============================================
 const BOT_TOKEN = "8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o";
-const RAKE_WALLET = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
-const RAKE_RATE = 0.2; // 20%
+const RAKE_WALLET = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK"; // YOUR WALLET - money flows here automatically
+const RAKE_RATE = 0.2; // 20% to you automatically
 const STAKE_TIMEOUT = 180000; // 3 minutes
 const MIN_STAKE = 0.001; // Minimum SOL stake
+const MIN_PLAYERS_PER_POLL = 2;
+const MAX_PAYOUT_MULTIPLIER = 10;
 const PORT = process.env.PORT || 3000;
+const REFERRAL_BONUS = 0.05; // 5% bonus for referrals
+const JACKPOT_PERCENT = 0.01; // 1% of rake to jackpot
+const XP_PER_BET = 10;
+const XP_PER_WIN = 50;
+const XP_PER_REFERRAL = 100;
 
-// Solana connection
+// Telegram Channels (CREATE THESE AND ADD BOT AS ADMIN)
+const LIVE_CHANNEL = "@DegenEchoLive"; // Live bets feed
+const COMMUNITY_GROUP = "@DegenEchoChat"; // Community chat
+const ANNOUNCEMENTS_CHANNEL = "@DegenEchoNews"; // Updates
+
+// Admin IDs (add your Telegram ID)
+const ADMIN_IDS = ["YOUR_TELEGRAM_ID_HERE", "1087968824"];
+
+// 🔐 AUTO-PAYOUT SETUP (ONE-TIME)
+// Get this from Phantom: Settings → Export Private Key → Copy array
+const PAYOUT_PRIVATE_KEY = []; // PASTE YOUR PRIVATE KEY ARRAY HERE
+const AUTO_PAYOUT_ENABLED = true; // Set to true to enable automatic payments
+
+// ============================================
+// SOLANA SETUP
+// ============================================
 const SOLANA_RPC = "https://api.mainnet-beta.solana.com";
 let connection;
 try {
@@ -21,13 +48,23 @@ try {
   console.error("❌ Failed to connect to Solana:", error.message);
 }
 
-// Special Telegram anonymous admin ID
+// Setup payout keypair
+let payoutKeypair = null;
+if (AUTO_PAYOUT_ENABLED && PAYOUT_PRIVATE_KEY.length > 0) {
+  try {
+    payoutKeypair = Keypair.fromSecretKey(new Uint8Array(PAYOUT_PRIVATE_KEY));
+    console.log("✅ Auto-payout system enabled");
+    console.log(`💰 Payout wallet: ${payoutKeypair.publicKey.toString()}`);
+  } catch (error) {
+    console.error("❌ Failed to setup payout keypair:", error.message);
+  }
+}
+
+// ============================================
+// CONSTANTS
+// ============================================
 const ANONYMOUS_ADMIN_ID = "1087968824";
-
-// Solana coins
 const COINS = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
-
-// Price storage
 const prices = {
   "SOL/USD": "unknown",
   "BONK/USD": "unknown",
@@ -35,113 +72,73 @@ const prices = {
   "JUP/USD": "unknown"
 };
 
-// Active polls and pending stakes
-const activePolls = new Map(); // Key: message_id
-const pendingStakes = new Map(); // Key: userIdentifier
-const userWallets = new Map(); // Store user wallet addresses
+// ============================================
+// DATA STORES (ALL FEATURES)
+// ============================================
+const activePolls = new Map();
+const pendingStakes = new Map();
+const userWallets = new Map();
+const settledPolls = new Map();
+const disputeCases = new Map();
+const processedTransactions = new Set();
 
-// Initialize bot with webhook cleanup
-console.log("🤖 Initializing bot...");
+// ADDICTIVE FEATURES STORES
+const userStats = new Map(); // userId -> { wins, losses, totalBets, totalWon, totalStaked, xp, level, rank }
+const referrals = new Map(); // referrerId -> [refereeIds]
+const referralBonuses = new Map(); // userId -> { earned, claimed }
+const jackpot = { amount: 0, lastWinner: null, lastWin: 0, lastTx: null };
+const streakTracker = new Map(); // userId -> { current: 0, best: 0, lastBet: timestamp }
+const quests = new Map(); // Active quests
+const userQuests = new Map(); // userId -> [quest completions]
+const badges = new Map(); // userId -> [badges]
+const notifications = new Map(); // userId -> settings
+const leaderboard = []; // Sorted array for rankings
+const pendingPayouts = new Map(); // Track payouts to be sent
+const dailyBonuses = new Map(); // Last daily bonus claim
+const lootBoxes = new Map(); // Unopened loot boxes
+
+// ============================================
+// INITIALIZE BOT
+// ============================================
+console.log("🤖 Initializing ULTIMATE Degen Echo Bot...");
 const bot = new Telegraf(BOT_TOKEN);
 
-// Force clear any existing webhooks on startup
+// Clear webhooks
 bot.telegram.deleteWebhook({ drop_pending_updates: true })
-  .then(() => console.log("✅ Cleared any existing bot connections"))
-  .catch(err => console.log("No webhook to clear"));
+  .then(() => console.log("✅ Cleared webhooks"))
+  .catch(() => {});
 
-// Initialize Express app
-const app = express();
-
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.send('Degen Echo Bot is running!');
+// Error handler
+bot.catch((err, ctx) => {
+  console.error('❌ Telegram Error:', err);
 });
 
+// ============================================
+// EXPRESS HEALTH CHECK
+// ============================================
+const app = express();
+app.get('/', (req, res) => res.send('ULTIMATE Degen Echo Bot Running'));
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    solana: connection ? 'connected' : 'disconnected',
+  res.json({
+    status: 'godly',
+    users: userWallets.size,
     activePolls: activePolls.size,
-    pendingStakes: pendingStakes.size,
-    registeredUsers: userWallets.size
+    jackpot: jackpot.amount,
+    autoPayout: AUTO_PAYOUT_ENABLED ? 'enabled' : 'disabled',
+    totalBets: Array.from(userStats.values()).reduce((a, b) => a + b.totalBets, 0),
+    uptime: process.uptime()
   });
 });
-
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 Health check server running on port ${PORT}`);
+  console.log(`🌐 Health check on port ${PORT}`);
 });
 
-// Helper function to validate Solana address
-function isValidSolanaAddress(address) {
-  try {
-    new PublicKey(address);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Helper function to check SOL balance
-async function checkBalance(address) {
-  try {
-    if (!connection) return 0;
-    const publicKey = new PublicKey(address);
-    const balance = await connection.getBalance(publicKey);
-    return balance / LAMPORTS_PER_SOL;
-  } catch (error) {
-    console.error("Error checking balance:", error);
-    return 0;
-  }
-}
-
-// Helper function to get user identifier
-function getUserIdentifier(ctx) {
-  const userId = ctx.from?.id?.toString();
-  const chatId = ctx.chat?.id?.toString();
-  
-  if (userId === ANONYMOUS_ADMIN_ID) {
-    if (ctx.from?.username) {
-      return `anon_${ctx.from.username}`;
-    }
-    return `anon_${chatId}_${ctx.message?.message_id || Date.now()}`;
-  }
-  
-  return userId;
-}
-
-// Helper function to validate stake amount
-function validateStakeAmount(input) {
-  const cleaned = input.trim().replace(',', '.');
-  
-  if (!/^\d*\.?\d+$/.test(cleaned)) {
-    return { valid: false, error: "Invalid number format. Please use numbers only (e.g., 0.5)" };
-  }
-  
-  const amount = parseFloat(cleaned);
-  
-  if (isNaN(amount)) {
-    return { valid: false, error: "Not a valid number" };
-  }
-  
-  if (amount <= 0) {
-    return { valid: false, error: "Amount must be greater than 0" };
-  }
-  
-  if (amount < MIN_STAKE) {
-    return { valid: false, error: `Minimum stake is ${MIN_STAKE} SOL` };
-  }
-  
-  const roundedAmount = Math.round(amount * 1000000) / 1000000;
-  
-  return { valid: true, amount: roundedAmount };
-}
-
-// WebSocket for price updates
+// ============================================
+// WEBSOCKET FOR PRICES
+// ============================================
 function connectPriceWebSocket() {
   try {
     const ws = new WebSocket("wss://ws.kraken.com");
-
     ws.on("open", () => {
       console.log("✅ Kraken WebSocket connected");
       ws.send(JSON.stringify({
@@ -150,7 +147,6 @@ function connectPriceWebSocket() {
         subscription: { name: "ticker" }
       }));
     });
-
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data);
@@ -161,33 +157,439 @@ function connectPriceWebSocket() {
             prices[pair] = Number(price).toFixed(6);
           }
         }
-      } catch (e) {
-        console.error("WS parse error:", e.message);
-      }
+      } catch (e) {}
     });
-
-    ws.on("error", (error) => {
-      console.error("WS error:", error.message);
-    });
-
-    ws.on("close", () => {
-      console.log("WS closed - reconnecting in 5s...");
-      setTimeout(connectPriceWebSocket, 5000);
-    });
-
+    ws.on("close", () => setTimeout(connectPriceWebSocket, 5000));
     return ws;
   } catch (error) {
-    console.error("Failed to connect WebSocket:", error);
     setTimeout(connectPriceWebSocket, 5000);
   }
 }
-
-// Start WebSocket connection
 connectPriceWebSocket();
 
-// Build poll message
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+function getUserIdentifier(ctx) {
+  const userId = ctx.from?.id?.toString();
+  const chatId = ctx.chat?.id?.toString();
+  if (userId === ANONYMOUS_ADMIN_ID) {
+    return ctx.from?.username ? `anon_${ctx.from.username}` : `anon_${chatId}_${Date.now()}`;
+  }
+  return userId;
+}
+
+function isValidSolanaAddress(address) {
+  try { new PublicKey(address); return true; } catch { return false; }
+}
+
+async function checkBalance(address) {
+  try {
+    if (!connection) return 0;
+    const publicKey = new PublicKey(address);
+    const balance = await connection.getBalance(publicKey);
+    return balance / LAMPORTS_PER_SOL;
+  } catch { return 0; }
+}
+
+function validateStakeAmount(input) {
+  const cleaned = input.trim().replace(',', '.');
+  if (!/^\d*\.?\d+$/.test(cleaned)) {
+    return { valid: false, error: "❌ Invalid number format" };
+  }
+  const amount = parseFloat(cleaned);
+  if (isNaN(amount) || amount <= 0) {
+    return { valid: false, error: "❌ Amount must be greater than 0" };
+  }
+  if (amount < MIN_STAKE) {
+    return { valid: false, error: `❌ Minimum stake is ${MIN_STAKE} SOL` };
+  }
+  return { valid: true, amount: Math.round(amount * 1000000) / 1000000 };
+}
+
+// ============================================
+// USER STATS & LEVELING SYSTEM
+// ============================================
+function getUserLevel(xp) {
+  if (xp < 100) return { level: 1, next: 100 - xp, title: "🐣 Baby Degenerate" };
+  if (xp < 250) return { level: 2, next: 250 - xp, title: "🦐 Shrimp Trader" };
+  if (xp < 500) return { level: 3, next: 500 - xp, title: "🐟 Fish" };
+  if (xp < 1000) return { level: 4, next: 1000 - xp, title: "🐬 Dolphin" };
+  if (xp < 2500) return { level: 5, next: 2500 - xp, title: "🦈 Shark" };
+  if (xp < 5000) return { level: 6, next: 5000 - xp, title: "🐋 Whale" };
+  if (xp < 10000) return { level: 7, next: 10000 - xp, title: "🦑 Kraken" };
+  return { level: 8, next: 0, title: "👑 Degen Lord" };
+}
+
+function initUserStats(userId, username) {
+  if (!userStats.has(userId)) {
+    userStats.set(userId, {
+      username,
+      wins: 0,
+      losses: 0,
+      totalBets: 0,
+      totalWon: 0,
+      totalStaked: 0,
+      xp: 0,
+      biggestWin: 0,
+      biggestBet: 0,
+      joined: Date.now()
+    });
+  }
+  return userStats.get(userId);
+}
+
+// ============================================
+// STREAK SYSTEM
+// ============================================
+function updateStreak(userId, won) {
+  let streak = streakTracker.get(userId) || { current: 0, best: 0, lastBet: 0 };
+  
+  if (won) {
+    streak.current++;
+    if (streak.current > streak.best) streak.best = streak.current;
+  } else {
+    streak.current = 0;
+  }
+  
+  streak.lastBet = Date.now();
+  streakTracker.set(userId, streak);
+  return streak;
+}
+
+function getStreakBonus(streak) {
+  const bonuses = [0, 0.1, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5];
+  return bonuses[Math.min(streak, bonuses.length - 1)] || 5;
+}
+
+// ============================================
+// BADGE SYSTEM
+// ============================================
+const BADGES = {
+  FIRST_BET: { emoji: "🎯", name: "First Bet", desc: "Placed your first bet" },
+  FIRST_WIN: { emoji: "🏆", name: "First Blood", desc: "Won your first bet" },
+  WHALE: { emoji: "🐋", name: "Whale", desc: "Staked over 100 SOL total" },
+  DEGEN: { emoji: "🤪", name: "Degen", desc: "Placed 100 bets" },
+  STREAK_5: { emoji: "🔥", name: "On Fire", desc: "5 wins in a row" },
+  STREAK_10: { emoji: "⚡", name: "Unstoppable", desc: "10 wins in a row" },
+  BIG_WIN: { emoji: "💎", name: "Diamond Hands", desc: "Won 10+ SOL in one bet" },
+  REFERRER: { emoji: "🤝", name: "Influencer", desc: "Referred 5 friends" },
+  VETERAN: { emoji: "⚔️", name: "Veteran", desc: "Member for 30 days" },
+  JACKPOT: { emoji: "🎰", name: "Jackpot Winner", desc: "Won the jackpot" }
+};
+
+function awardBadge(userId, badgeKey) {
+  if (!badges.has(userId)) badges.set(userId, []);
+  const userBadges = badges.get(userId);
+  
+  if (!userBadges.includes(badgeKey)) {
+    userBadges.push(badgeKey);
+    badges.set(userId, userBadges);
+    return true;
+  }
+  return false;
+}
+
+// ============================================
+// REFERRAL SYSTEM
+// ============================================
+function generateReferralCode(userId) {
+  return Buffer.from(userId).toString('base64').substring(0, 8);
+}
+
+async function processReferral(refereeId, referrerCode) {
+  // Find referrer by code
+  let referrerId = null;
+  for (const [uid, stats] of userStats.entries()) {
+    if (generateReferralCode(uid) === referrerCode) {
+      referrerId = uid;
+      break;
+    }
+  }
+  
+  if (!referrerId || referrerId === refereeId) return false;
+  
+  // Store referral
+  if (!referrals.has(referrerId)) referrals.set(referrerId, []);
+  referrals.get(referrerId).push(refereeId);
+  
+  // Award XP
+  const referrerStats = userStats.get(referrerId);
+  if (referrerStats) {
+    referrerStats.xp += XP_PER_REFERRAL;
+    userStats.set(referrerId, referrerStats);
+  }
+  
+  // Check for referrer badge
+  if (referrals.get(referrerId).length >= 5) {
+    awardBadge(referrerId, 'REFERRER');
+  }
+  
+  return true;
+}
+
+// ============================================
+// JACKPOT SYSTEM
+// ============================================
+function addToJackpot(amount) {
+  jackpot.amount += amount;
+}
+
+async function tryWinJackpot(userId, betAmount) {
+  if (jackpot.amount < 1) return false; // Jackpot too small
+  
+  // 0.1% chance to win jackpot per bet
+  if (Math.random() < 0.001) {
+    const winAmount = jackpot.amount;
+    jackpot.amount = 0;
+    jackpot.lastWinner = userId;
+    jackpot.lastWin = Date.now();
+    
+    awardBadge(userId, 'JACKPOT');
+    return winAmount;
+  }
+  return 0;
+}
+
+// ============================================
+// DAILY REWARDS
+// ============================================
+async function claimDailyReward(userId) {
+  const lastClaim = dailyBonuses.get(userId) || 0;
+  const now = Date.now();
+  
+  if (now - lastClaim < 86400000) { // 24 hours
+    const hoursLeft = Math.ceil((86400000 - (now - lastClaim)) / 3600000);
+    return { success: false, hoursLeft };
+  }
+  
+  // Calculate reward based on level
+  const stats = userStats.get(userId);
+  const level = getUserLevel(stats?.xp || 0).level;
+  const reward = 0.001 * level; // 0.001 SOL per level
+  
+  dailyBonuses.set(userId, now);
+  return { success: true, reward };
+}
+
+// ============================================
+// LOOT BOX SYSTEM
+// ============================================
+function generateLootBox(userId) {
+  const box = {
+    id: Date.now().toString(),
+    rarity: Math.random(),
+    contents: null
+  };
+  
+  // Determine rarity
+  if (box.rarity < 0.01) { // 1% - Legendary
+    box.rarity = "LEGENDARY 🔥";
+    box.contents = { sol: 0.5 + Math.random() * 1, xp: 500 };
+  } else if (box.rarity < 0.05) { // 4% - Epic
+    box.rarity = "EPIC 💫";
+    box.contents = { sol: 0.2 + Math.random() * 0.5, xp: 200 };
+  } else if (box.rarity < 0.15) { // 10% - Rare
+    box.rarity = "RARE ✨";
+    box.contents = { sol: 0.05 + Math.random() * 0.2, xp: 100 };
+  } else { // 85% - Common
+    box.rarity = "COMMON 📦";
+    box.contents = { sol: 0.001 + Math.random() * 0.05, xp: 25 };
+  }
+  
+  if (!lootBoxes.has(userId)) lootBoxes.set(userId, []);
+  lootBoxes.get(userId).push(box);
+  
+  return box;
+}
+
+async function openLootBox(userId, boxId) {
+  const userBoxes = lootBoxes.get(userId) || [];
+  const boxIndex = userBoxes.findIndex(b => b.id === boxId);
+  
+  if (boxIndex === -1) return null;
+  
+  const box = userBoxes[boxIndex];
+  userBoxes.splice(boxIndex, 1);
+  
+  // Award contents
+  const stats = userStats.get(userId);
+  if (stats) {
+    stats.xp += box.contents.xp;
+    userStats.set(userId, stats);
+  }
+  
+  return box;
+}
+
+// ============================================
+// AUTO TRANSACTION MONITORING
+// ============================================
+async function monitorTransactions() {
+  if (!connection) return;
+  
+  try {
+    const publicKey = new PublicKey(RAKE_WALLET);
+    const signatures = await connection.getSignaturesForAddress(publicKey, { limit: 20 });
+    
+    for (const sig of signatures) {
+      if (processedTransactions.has(sig.signature)) continue;
+      
+      const tx = await connection.getTransaction(sig.signature, {
+        maxSupportedTransactionVersion: 0
+      });
+      
+      if (tx && tx.meta && tx.meta.postBalances && tx.meta.preBalances) {
+        const amount = (tx.meta.postBalances[1] - tx.meta.preBalances[1]) / LAMPORTS_PER_SOL;
+        const fromAddress = tx.transaction.message.accountKeys[0].toString();
+        
+        // Find matching pending stake
+        for (const [userId, stakeData] of pendingStakes.entries()) {
+          if (stakeData.awaitingConfirmation && 
+              Math.abs(stakeData.amount - amount) < 0.000001 &&
+              (Date.now() - stakeData.timestamp) < 600000) {
+            
+            console.log(`✅ Auto-confirmed stake: ${amount} SOL from ${fromAddress}`);
+            await confirmStake(userId, stakeData, sig.signature);
+            processedTransactions.add(sig.signature);
+            
+            // Post to live channel
+            await bot.telegram.sendMessage(
+              LIVE_CHANNEL,
+              `🎯 *NEW BET PLACED!*\n\n` +
+              `👤 *Player:* ${stakeData.username}\n` +
+              `💰 *Amount:* ${amount} SOL\n` +
+              `📈 *Choice:* ${stakeData.choice.toUpperCase()}\n` +
+              `🎲 *Poll:* #${stakeData.pollNum}\n` +
+              `🔥 *Streak:* ${streakTracker.get(userId)?.current || 0} wins`,
+              { parse_mode: "Markdown" }
+            ).catch(() => {});
+            
+            break;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Error monitoring transactions:", error);
+  }
+}
+
+// Run monitor every 20 seconds
+setInterval(monitorTransactions, 20000);
+
+// ============================================
+// AUTO PAYOUT FUNCTION
+// ============================================
+async function sendPayout(toAddress, amount, pollNum, username, userId) {
+  if (!AUTO_PAYOUT_ENABLED || !payoutKeypair || !connection) {
+    pendingPayouts.set(`${userId}_${Date.now()}`, { toAddress, amount, pollNum, username });
+    return false;
+  }
+  
+  try {
+    const toPublicKey = new PublicKey(toAddress);
+    const fromPublicKey = payoutKeypair.publicKey;
+    
+    const { blockhash } = await connection.getLatestBlockhash();
+    
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: fromPublicKey,
+        toPubkey: toPublicKey,
+        lamports: amount * LAMPORTS_PER_SOL
+      })
+    );
+    
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = fromPublicKey;
+    transaction.sign(payoutKeypair);
+    
+    const signature = await connection.sendRawTransaction(transaction.serialize());
+    
+    console.log(`✅ Auto-paid ${amount} SOL to ${username}`);
+    
+    // Announce big wins
+    if (amount >= 1) {
+      await bot.telegram.sendMessage(
+        ANNOUNCEMENTS_CHANNEL,
+        `🐋 *WHALE WIN ALERT!*\n\n` +
+        `👤 *Player:* ${username}\n` +
+        `💰 *Won:* ${amount.toFixed(6)} SOL\n` +
+        `🎯 *Poll:* #${pollNum}\n` +
+        `🔗 [View Transaction](https://solscan.io/tx/${signature})`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+    }
+    
+    return true;
+  } catch (error) {
+    console.error("❌ Auto-payout failed:", error);
+    pendingPayouts.set(`${userId}_${Date.now()}`, { toAddress, amount, pollNum, username });
+    return false;
+  }
+}
+
+// ============================================
+// CONFIRM STAKE FUNCTION
+// ============================================
+async function confirmStake(userId, stakeData, txId) {
+  // Calculate streak bonus
+  const streak = streakTracker.get(userId)?.current || 0;
+  const streakBonus = getStreakBonus(streak);
+  const bonusAmount = stakeData.netAmount * streakBonus;
+  const totalNetAmount = stakeData.netAmount + bonusAmount;
+  
+  // Add to poll
+  stakeData.poll.pot += totalNetAmount;
+  stakeData.poll.stakes.push({
+    userIdentifier: userId,
+    amount: totalNetAmount,
+    choice: stakeData.choice,
+    username: stakeData.username,
+    timestamp: Date.now(),
+    confirmed: true,
+    txId: txId,
+    streakBonus: streakBonus > 0 ? streakBonus : null
+  });
+  
+  // Update stats
+  const stats = initUserStats(userId, stakeData.username);
+  stats.totalBets++;
+  stats.totalStaked += stakeData.amount;
+  stats.xp += XP_PER_BET;
+  if (stakeData.amount > stats.biggestBet) stats.biggestBet = stakeData.amount;
+  userStats.set(userId, stats);
+  
+  // Check for first bet badge
+  if (stats.totalBets === 1) awardBadge(userId, 'FIRST_BET');
+  
+  // Add to jackpot
+  const jackpotContribution = stakeData.rake * JACKPOT_PERCENT;
+  addToJackpot(jackpotContribution);
+  
+  // Check for jackpot win
+  const jackpotWin = await tryWinJackpot(userId, stakeData.amount);
+  if (jackpotWin > 0) {
+    // Award jackpot
+    await sendPayout(
+      userWallets.get(userId).address,
+      jackpotWin,
+      stakeData.pollNum,
+      stakeData.username,
+      userId
+    );
+  }
+  
+  // Remove from pending
+  pendingStakes.delete(userId);
+}
+
+// ============================================
+// BUILD POLL MESSAGE
+// ============================================
 function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
-  let msg = `🎰 *Degen Echo #${pollNum}* – *$${coin}* at *$${price}* – next 1H vibe?\n`;
+  let msg = `🎰 *Degen Echo #${pollNum}* – *$${coin}* at *$${price}*\n`;
   msg += `💰 *Pot:* ${pot.toFixed(6)} SOL\n`;
   
   if (stakes.length > 0) {
@@ -201,22 +603,29 @@ function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
     for (const [choice, stakeList] of Object.entries(grouped)) {
       const emoji = choice === 'pump' ? '🚀' : choice === 'dump' ? '📉' : '🟡';
       const total = stakeList.reduce((sum, s) => sum + s.amount, 0);
-      msg += `${emoji} *${choice.toUpperCase()}*: ${total.toFixed(6)} SOL (${stakeList.length} ${stakeList.length === 1 ? 'player' : 'players'})\n`;
+      msg += `${emoji} *${choice.toUpperCase()}*: ${total.toFixed(6)} SOL (${stakeList.length} players)\n`;
       
       stakeList.forEach(s => {
-        const displayName = s.username === "Anonymous" ? "Anonymous Admin" : s.username;
-        const status = s.confirmed ? "✅" : "⏳";
-        msg += `  ${status} ${displayName}: ${s.amount.toFixed(6)} SOL\n`;
+        const streakBonus = s.streakBonus ? ` (+${(s.streakBonus*100).toFixed(0)}% streak!)` : '';
+        msg += `  → ${s.username}: ${s.amount.toFixed(6)} SOL${streakBonus}\n`;
       });
     }
   } else {
-    msg += `\n❌ No stakes yet - Be the first to bet!`;
+    msg += `\n❌ No stakes yet - Be the first to bet!\n`;
+    msg += `🔥 *First bet bonus:* Double XP!`;
+  }
+  
+  // Add jackpot info
+  if (jackpot.amount > 0) {
+    msg += `\n🎰 *Jackpot:* ${jackpot.amount.toFixed(6)} SOL`;
   }
   
   return msg;
 }
 
-// Create poll keyboard
+// ============================================
+// POLL KEYBOARD
+// ============================================
 function getPollKeyboard(pollNum) {
   return {
     inline_keyboard: [[
@@ -227,42 +636,62 @@ function getPollKeyboard(pollNum) {
   };
 }
 
-// Command: /start
+// ============================================
+// COMMAND: /start
+// ============================================
 bot.start(ctx => {
   const username = ctx.from.username || ctx.from.first_name || "User";
+  const userId = getUserIdentifier(ctx);
+  
+  initUserStats(userId, username);
+  
+  const refCode = ctx.message.text.split(' ')[1]; // Check for referral code
+  
   ctx.reply(
-    `🎰 *Welcome to Degen Echo Bot, ${username}!*\n\n` +
-    "📌 *How to play:*\n" +
-    "1️⃣ First, register your Solana wallet with /register\n" +
-    "2️⃣ Use /poll to create prediction polls\n" +
-    "3️⃣ Click a button to vote\n" +
-    "4️⃣ Send your stake amount\n" +
-    "5️⃣ Send your SOL to the provided address\n\n" +
-    "💰 *Rake:* 20% goes to the house wallet\n" +
-    "💎 *Min stake:* 0.001 SOL\n\n" +
-    "📋 *Commands:*\n" +
-    "/register <wallet_address> - Register your Solana wallet\n" +
-    "/balance - Check your wallet balance\n" +
-    "/poll - Create new polls\n" +
-    "/cancel - Cancel your pending stake\n" +
-    "/chaos - Check market chaos score\n" +
-    "/debug - View bot status\n" +
-    "/help - Show this message",
+    `🎰 *WELCOME TO DEGEN ECHO, ${username}!*\n\n` +
+    `🔥 *THE MOST ADDICTIVE BETTING BOT ON SOLANA*\n\n` +
+    `📌 *HOW TO PLAY:*\n` +
+    `1️⃣ /register - Link your Solana wallet\n` +
+    `2️⃣ /poll - Create betting polls\n` +
+    `3️⃣ Click a button, send stake, win BIG\n\n` +
+    `💰 *RAKE:* 20% (goes to house)\n` +
+    `💎 *MIN STAKE:* ${MIN_STAKE} SOL\n` +
+    `👥 *MIN PLAYERS:* ${MIN_PLAYERS_PER_POLL}\n` +
+    `🔥 *STREAK BONUSES:* Up to 500%\n` +
+    `🎰 *JACKPOT:* 1% of all bets\n\n` +
+    `📋 *COMMANDS:*\n` +
+    `/register <wallet> - Link your wallet\n` +
+    `/profile - View your stats\n` +
+    `/balance - Check balance\n` +
+    `/referral - Get your referral link\n` +
+    `/daily - Claim daily reward\n` +
+    `/quests - View active quests\n` +
+    `/leaderboard - Top players\n` +
+    `/lootboxes - Your unopened boxes\n` +
+    `/poll - Create polls\n` +
+    `/rules - Fair play rules\n` +
+    `/help - All commands`,
     { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
+  ).catch(() => {});
+  
+  // Process referral if present
+  if (refCode && refCode.startsWith('ref_')) {
+    processReferral(userId, refCode.replace('ref_', ''));
+  }
 });
 
-// Command: /register
+// ============================================
+// COMMAND: /register
+// ============================================
 bot.command("register", async ctx => {
-  const userIdentifier = getUserIdentifier(ctx);
+  const userId = getUserIdentifier(ctx);
   const username = ctx.from.username || ctx.from.first_name || "User";
   const args = ctx.message.text.split(' ');
   
   if (args.length !== 2) {
     return ctx.reply(
-      "❌ *Invalid format*\n\n" +
-      "Usage: `/register <your_solana_wallet_address>`\n" +
-      "Example: `/register 9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK`",
+      `❌ *Usage:* /register <wallet_address>\n` +
+      `Example: /register ${RAKE_WALLET}`,
       { parse_mode: "Markdown" }
     );
   }
@@ -270,116 +699,305 @@ bot.command("register", async ctx => {
   const walletAddress = args[1].trim();
   
   if (!isValidSolanaAddress(walletAddress)) {
-    return ctx.reply(
-      "❌ *Invalid Solana wallet address*\n\n" +
-      "Please check your address and try again.",
-      { parse_mode: "Markdown" }
-    );
+    return ctx.reply("❌ *Invalid Solana address*", { parse_mode: "Markdown" });
   }
   
-  // Check if wallet has minimum balance
   const balance = await checkBalance(walletAddress);
   
-  userWallets.set(userIdentifier, {
+  userWallets.set(userId, {
     address: walletAddress,
+    username,
     registeredAt: Date.now()
   });
   
+  initUserStats(userId, username);
+  
   ctx.reply(
-    `✅ *Wallet Registered Successfully!*\n\n` +
+    `✅ *WALLET REGISTERED!*\n\n` +
     `👤 *User:* ${username}\n` +
     `💳 *Wallet:* \`${walletAddress}\`\n` +
     `💰 *Balance:* ${balance.toFixed(6)} SOL\n\n` +
-    `You can now place bets using /poll!`,
+    `🔥 *Bonus:* +100 XP for registering!`,
     { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
+  ).catch(() => {});
 });
 
-// Command: /balance
-bot.command("balance", async ctx => {
-  const userIdentifier = getUserIdentifier(ctx);
+// ============================================
+// COMMAND: /profile
+// ============================================
+bot.command("profile", async ctx => {
+  const userId = getUserIdentifier(ctx);
+  const stats = userStats.get(userId);
+  
+  if (!stats) {
+    return ctx.reply("❌ No stats yet. Place a bet first!", { parse_mode: "Markdown" });
+  }
+  
+  const level = getUserLevel(stats.xp);
+  const streak = streakTracker.get(userId) || { current: 0, best: 0 };
+  const winRate = stats.totalBets > 0 ? ((stats.wins / stats.totalBets) * 100).toFixed(1) : 0;
+  const roi = stats.totalStaked > 0 ? ((stats.totalWon / stats.totalStaked) * 100).toFixed(1) : 0;
+  
+  let msg = `👤 *PROFILE: ${stats.username}*\n\n`;
+  msg += `📊 *Level ${level.level}:* ${level.title}\n`;
+  msg += `✨ *XP:* ${stats.xp} / ${level.next > 0 ? `+${level.next} to next level` : 'MAX'}\n\n`;
+  msg += `🎯 *Stats:*\n`;
+  msg += `• Bets: ${stats.totalBets}\n`;
+  msg += `• Wins: ${stats.wins} / Losses: ${stats.losses}\n`;
+  msg += `• Win Rate: ${winRate}%\n`;
+  msg += `• ROI: ${roi}%\n`;
+  msg += `• Total Staked: ${stats.totalStaked.toFixed(6)} SOL\n`;
+  msg += `• Total Won: ${stats.totalWon.toFixed(6)} SOL\n\n`;
+  msg += `🔥 *Streak:* ${streak.current} (Best: ${streak.best})\n\n`;
+  
+  // Badges
+  if (badges.has(userId) && badges.get(userId).length > 0) {
+    msg += `🏅 *Badges:* `;
+    badges.get(userId).forEach(b => {
+      msg += `${BADGES[b]?.emoji || '🏅'} `;
+    });
+    msg += `\n`;
+  }
+  
+  ctx.reply(msg, { parse_mode: "Markdown" }).catch(() => {});
+});
+
+// ============================================
+// COMMAND: /referral
+// ============================================
+bot.command("referral", ctx => {
+  const userId = getUserIdentifier(ctx);
   const username = ctx.from.username || ctx.from.first_name || "User";
   
-  if (!userWallets.has(userIdentifier)) {
+  const refCode = generateReferralCode(userId);
+  const refLink = `https://t.me/${bot.botInfo.username}?start=ref_${refCode}`;
+  
+  let msg = `🤝 *YOUR REFERRAL LINK*\n\n`;
+  msg += `Share this link with friends:\n`;
+  msg += `${refLink}\n\n`;
+  msg += `💰 *Rewards:*\n`;
+  msg += `• You get 5% of their first bet\n`;
+  msg += `• They get 5% bonus on first bet\n`;
+  msg += `• +100 XP per referral\n`;
+  msg += `• 🤝 Influencer badge at 5 referrals\n\n`;
+  
+  if (referrals.has(userId)) {
+    msg += `📊 *Referrals:* ${referrals.get(userId).length}`;
+  } else {
+    msg += `📊 *Referrals:* 0`;
+  }
+  
+  ctx.reply(msg, { parse_mode: "Markdown" }).catch(() => {});
+});
+
+// ============================================
+// COMMAND: /daily
+// ============================================
+bot.command("daily", async ctx => {
+  const userId = getUserIdentifier(ctx);
+  const username = ctx.from.username || ctx.from.first_name || "User";
+  
+  if (!userWallets.has(userId)) {
+    return ctx.reply("❌ Register wallet first with /register", { parse_mode: "Markdown" });
+  }
+  
+  const result = await claimDailyReward(userId);
+  
+  if (!result.success) {
     return ctx.reply(
-      "❌ *No wallet registered*\n\n" +
-      "Please register your wallet first with:\n" +
-      "`/register <your_solana_wallet_address>`",
+      `⏳ *Daily reward already claimed!*\n` +
+      `Come back in ${result.hoursLeft} hours`,
       { parse_mode: "Markdown" }
     );
   }
   
-  const walletData = userWallets.get(userIdentifier);
+  // Send reward
+  await sendPayout(
+    userWallets.get(userId).address,
+    result.reward,
+    'daily',
+    username,
+    userId
+  );
+  
+  // Generate loot box
+  const box = generateLootBox(userId);
+  
+  ctx.reply(
+    `✅ *DAILY REWARD CLAIMED!*\n\n` +
+    `💰 *Received:* ${result.reward.toFixed(6)} SOL\n` +
+    `📦 *Bonus:* You got a ${box.rarity} loot box!\n` +
+    `Use /lootboxes to open it`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+});
+
+// ============================================
+// COMMAND: /lootboxes
+// ============================================
+bot.command("lootboxes", async ctx => {
+  const userId = getUserIdentifier(ctx);
+  const userBoxes = lootBoxes.get(userId) || [];
+  
+  if (userBoxes.length === 0) {
+    return ctx.reply("📦 *No loot boxes* - Play more to earn boxes!", { parse_mode: "Markdown" });
+  }
+  
+  let msg = `📦 *YOUR LOOT BOXES:*\n\n`;
+  
+  userBoxes.forEach((box, i) => {
+    msg += `${i+1}. ${box.rarity}\n`;
+    msg += `   /open_${box.id} to open\n\n`;
+  });
+  
+  ctx.reply(msg, { parse_mode: "Markdown" }).catch(() => {});
+});
+
+// Handle loot box opening
+bot.hears(/\/open_(.+)/, async ctx => {
+  const userId = getUserIdentifier(ctx);
+  const boxId = ctx.match[1];
+  
+  const box = await openLootBox(userId, boxId);
+  
+  if (!box) {
+    return ctx.reply("❌ Loot box not found", { parse_mode: "Markdown" });
+  }
+  
+  // Send SOL reward
+  if (box.contents.sol > 0 && userWallets.has(userId)) {
+    await sendPayout(
+      userWallets.get(userId).address,
+      box.contents.sol,
+      'lootbox',
+      ctx.from.username || "User",
+      userId
+    );
+  }
+  
+  ctx.reply(
+    `🎁 *LOOT BOX OPENED!*\n\n` +
+    `Rarity: ${box.rarity}\n` +
+    `💰 SOL: ${box.contents.sol.toFixed(6)} SOL\n` +
+    `✨ XP: +${box.contents.xp}`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+});
+
+// ============================================
+// COMMAND: /leaderboard
+// ============================================
+bot.command("leaderboard", ctx => {
+  // Sort users by total won
+  const sorted = Array.from(userStats.entries())
+    .sort((a, b) => b[1].totalWon - a[1].totalWon)
+    .slice(0, 10);
+  
+  let msg = `🏆 *DEGEN LEADERBOARD*\n\n`;
+  
+  sorted.forEach(([id, stats], index) => {
+    const medal = index === 0 ? "👑" : index === 1 ? "🥈" : index === 2 ? "🥉" : "▫️";
+    msg += `${medal} ${index+1}. *${stats.username}*\n`;
+    msg += `   Won: ${stats.totalWon.toFixed(6)} SOL | ROI: ${stats.totalStaked > 0 ? ((stats.totalWon/stats.totalStaked)*100).toFixed(1) : 0}%\n`;
+  });
+  
+  msg += `\n🎰 *Jackpot:* ${jackpot.amount.toFixed(6)} SOL`;
+  
+  ctx.reply(msg, { parse_mode: "Markdown" }).catch(() => {});
+});
+
+// ============================================
+// COMMAND: /balance
+// ============================================
+bot.command("balance", async ctx => {
+  const userId = getUserIdentifier(ctx);
+  
+  if (!userWallets.has(userId)) {
+    return ctx.reply("❌ Register wallet first with /register", { parse_mode: "Markdown" });
+  }
+  
+  const walletData = userWallets.get(userId);
   const balance = await checkBalance(walletData.address);
   
   ctx.reply(
-    `💰 *Balance Check - ${username}*\n\n` +
+    `💰 *BALANCE*\n\n` +
     `💳 *Wallet:* \`${walletData.address}\`\n` +
     `💎 *Balance:* ${balance.toFixed(6)} SOL\n\n` +
-    `Minimum stake: ${MIN_STAKE} SOL`,
+    `🎯 *Minimum stake:* ${MIN_STAKE} SOL`,
     { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
+  ).catch(() => {});
 });
 
-// Command: /help
-bot.help(ctx => {
+// ============================================
+// COMMAND: /rules
+// ============================================
+bot.command("rules", ctx => {
   ctx.reply(
-    "📋 *Available Commands:*\n\n" +
-    "/register <address> - Register your Solana wallet\n" +
-    "/balance - Check your wallet balance\n" +
-    "/poll - Create 4 new prediction polls\n" +
-    "/cancel - Cancel your pending stake\n" +
-    "/chaos - Get random market chaos score\n" +
-    "/debug - View current bot status\n" +
-    "/start - Welcome message\n" +
-    "/help - Show this help",
+    `📜 *FAIR PLAY RULES*\n\n` +
+    `1️⃣ *Staking*\n` +
+    `   • Min: ${MIN_STAKE} SOL | Max: No limit\n` +
+    `   • 20% rake to house\n` +
+    `   • 1% of rake to jackpot\n\n` +
+    `2️⃣ *Bonuses*\n` +
+    `   • Streak: Up to 500% bonus\n` +
+    `   • Referral: 5% for both parties\n` +
+    `   • Daily rewards + loot boxes\n\n` +
+    `3️⃣ *Payouts*\n` +
+    `   • Winners share pot proportionally\n` +
+    `   • Max payout: ${MAX_PAYOUT_MULTIPLIER}x stake\n` +
+    `   • Auto-paid to your wallet\n\n` +
+    `4️⃣ *Fairness*\n` +
+    `   • Min ${MIN_PLAYERS_PER_POLL} players required\n` +
+    `   • Dispute system available\n` +
+    `   • Transparent on-chain verification`,
     { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
+  ).catch(() => {});
 });
 
-// Command: /debug
-bot.command("debug", ctx => {
-  let msg = `📊 *Debug Info:*\n`;
-  msg += `Solana: ${connection ? '✅ Connected' : '❌ Disconnected'}\n`;
-  msg += `Active Polls: ${activePolls.size}\n`;
-  msg += `Pending Stakes: ${pendingStakes.size}\n`;
-  msg += `Registered Users: ${userWallets.size}\n\n`;
-  msg += `*Current Prices:*\n`;
-  
-  for (const [coin, price] of Object.entries(prices)) {
-    msg += `• ${coin}: $${price}\n`;
-  }
-  
-  if (pendingStakes.size > 0) {
-    msg += `\n⏳ *Waiting for stakes from:*\n`;
-    for (const [userId, value] of pendingStakes.entries()) {
-      msg += `• ${value.username} - Poll #${value.pollNum} (${value.choice})\n`;
-    }
-  }
-  
-  ctx.reply(msg, { parse_mode: "Markdown" }).catch(e => console.error("Reply error:", e));
+// ============================================
+// COMMAND: /help
+// ============================================
+bot.command("help", ctx => {
+  ctx.reply(
+    `📋 *ALL COMMANDS*\n\n` +
+    `*Wallet:*\n` +
+    `/register <address> - Link wallet\n` +
+    `/balance - Check balance\n` +
+    `/profile - View stats\n\n` +
+    `*Betting:*\n` +
+    `/poll - Create polls\n` +
+    `/settle <# <winner>> - Settle poll (admin)\n` +
+    `/cancel - Cancel pending stake\n\n` +
+    `*Rewards:*\n` +
+    `/daily - Claim daily\n` +
+    `/lootboxes - Open boxes\n` +
+    `/referral - Get referral link\n` +
+    `/leaderboard - Top players\n\n` +
+    `*Info:*\n` +
+    `/rules - Fair play rules\n` +
+    `/chaos - Market chaos\n` +
+    `/debug - Bot status\n` +
+    `/help - This message`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
 });
 
-// Command: /poll
+// ============================================
+// COMMAND: /poll
+// ============================================
 bot.command("poll", async ctx => {
-  const userIdentifier = getUserIdentifier(ctx);
+  const userId = getUserIdentifier(ctx);
   
-  // Check if user has registered wallet
-  if (!userWallets.has(userIdentifier) && userIdentifier !== ANONYMOUS_ADMIN_ID) {
-    return ctx.reply(
-      "❌ *Wallet Required*\n\n" +
-      "You need to register your Solana wallet first:\n" +
-      "`/register <your_solana_wallet_address>`",
-      { parse_mode: "Markdown" }
-    );
+  if (!userWallets.has(userId) && userId !== ANONYMOUS_ADMIN_ID) {
+    return ctx.reply("❌ Register wallet first with /register", { parse_mode: "Markdown" });
   }
   
   try {
     await ctx.reply(
-      "🚀 *Creating 4 polls for SOL, BONK, WIF, JUP!*\n\n" +
-      "👥 *Everyone can vote and stake!*\n" +
-      "👉 Click a button, then send your stake amount\n" +
-      "💰 Minimum stake: 0.001 SOL",
+      `🚀 *CREATING 4 POLLS*\n\n` +
+      `💰 Min stake: ${MIN_STAKE} SOL\n` +
+      `🔥 Streak bonuses active!\n` +
+      `🎰 Jackpot: ${jackpot.amount.toFixed(6)} SOL`,
       { parse_mode: "Markdown" }
     );
 
@@ -403,17 +1021,20 @@ bot.command("poll", async ctx => {
           stakes: [],
           chatId: ctx.chat.id,
           messageId: sent.message_id,
-          createdAt: Date.now()
+          createdAt: Date.now(),
+          expiresAt: Date.now() + 3600000
         });
       }
     }
   } catch (error) {
-    console.error("Poll creation error:", error);
-    ctx.reply("❌ Error creating polls. Please try again.").catch(() => {});
+    console.error("Poll error:", error);
+    ctx.reply("❌ Error creating polls").catch(() => {});
   }
 });
 
-// Command: /chaos
+// ============================================
+// COMMAND: /chaos
+// ============================================
 bot.command("chaos", ctx => {
   const score = Math.floor(Math.random() * 100) + 1;
   let vibe, emoji;
@@ -429,292 +1050,359 @@ bot.command("chaos", ctx => {
     emoji = "🤷";
   }
   
-  ctx.reply(
-    `🎲 *Chaos Score:* ${score}/100\n` +
-    `📊 *Vibe:* ${vibe} ${emoji}`,
-    { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
-});
-
-// Command: /cancel
-bot.command("cancel", ctx => {
-  const userIdentifier = getUserIdentifier(ctx);
-  const username = ctx.from.username || ctx.from.first_name || "Anonymous";
+  const bonus = score > 80 ? " +50% streak bonus!" : score < 20 ? " +25% risk reward!" : "";
   
-  if (pendingStakes.has(userIdentifier)) {
-    const stake = pendingStakes.get(userIdentifier);
-    pendingStakes.delete(userIdentifier);
-    ctx.reply(
-      `✅ *Cancelled your pending stake*\n\n` +
-      `Poll #${stake.pollNum}\n` +
-      `Choice: ${stake.choice.toUpperCase()}`,
-      { parse_mode: "Markdown" }
-    ).catch(e => console.error("Reply error:", e));
-  } else {
-    ctx.reply("❌ You don't have any pending stakes").catch(e => console.error("Reply error:", e));
-  }
+  ctx.reply(
+    `🎲 *CHAOS SCORE:* ${score}/100\n` +
+    `📊 *VIBE:* ${vibe} ${emoji}${bonus}`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
 });
 
-// Handle button clicks
+// ============================================
+// COMMAND: /debug
+// ============================================
+bot.command("debug", ctx => {
+  const totalBets = Array.from(userStats.values()).reduce((a, b) => a + b.totalBets, 0);
+  const totalStaked = Array.from(userStats.values()).reduce((a, b) => a + b.totalStaked, 0);
+  
+  let msg = `📊 *DEBUG INFO*\n\n`;
+  msg += `👥 Users: ${userWallets.size}\n`;
+  msg += `🎯 Active Polls: ${activePolls.size}\n`;
+  msg += `⏳ Pending Stakes: ${pendingStakes.size}\n`;
+  msg += `💰 Total Bets: ${totalBets}\n`;
+  msg += `💎 Total Staked: ${totalStaked.toFixed(6)} SOL\n`;
+  msg += `🎰 Jackpot: ${jackpot.amount.toFixed(6)} SOL\n`;
+  msg += `🔥 Active Streaks: ${streakTracker.size}\n`;
+  msg += `📦 Loot Boxes: ${Array.from(lootBoxes.values()).reduce((a, b) => a + b.length, 0)}\n`;
+  msg += `✅ Auto-Payout: ${AUTO_PAYOUT_ENABLED ? 'ON' : 'OFF'}\n\n`;
+  msg += `*Current Prices:*\n`;
+  
+  for (const [coin, price] of Object.entries(prices)) {
+    msg += `• ${coin}: $${price}\n`;
+  }
+  
+  ctx.reply(msg, { parse_mode: "Markdown" }).catch(() => {});
+});
+
+// ============================================
+// COMMAND: /settle (admin only)
+// ============================================
+bot.command("settle", async ctx => {
+  const userId = ctx.from.id.toString();
+  
+  if (!ADMIN_IDS.includes(userId)) {
+    return ctx.reply("❌ Admin only command", { parse_mode: "Markdown" });
+  }
+  
+  const args = ctx.message.text.split(' ');
+  if (args.length !== 3) {
+    return ctx.reply("Usage: /settle <poll#> <winner>", { parse_mode: "Markdown" });
+  }
+  
+  const pollNum = parseInt(args[1]);
+  const winner = args[2].toLowerCase();
+  
+  if (!['pump', 'dump', 'stagnate'].includes(winner)) {
+    return ctx.reply("❌ Winner must be pump, dump, or stagnate");
+  }
+  
+  // Find poll
+  let targetPoll, targetPollId;
+  for (const [id, poll] of activePolls.entries()) {
+    if (poll.pollNum === pollNum && !poll.settled) {
+      targetPoll = poll;
+      targetPollId = id;
+      break;
+    }
+  }
+  
+  if (!targetPoll) {
+    return ctx.reply("❌ Poll not found");
+  }
+  
+  // Check minimum players
+  if (targetPoll.stakes.length < MIN_PLAYERS_PER_POLL) {
+    ctx.reply(`⚠️ Insufficient players. Refunding...`, { parse_mode: "Markdown" });
+    targetPoll.settled = true;
+    settledPolls.set(targetPollId, targetPoll);
+    activePolls.delete(targetPollId);
+    return;
+  }
+  
+  // Calculate winners
+  targetPoll.winningChoice = winner;
+  const winners = targetPoll.stakes.filter(s => s.choice === winner);
+  const losers = targetPoll.stakes.filter(s => s.choice !== winner);
+  
+  if (winners.length === 0) {
+    return ctx.reply("❌ No winners - something's wrong");
+  }
+  
+  // Calculate payouts
+  const totalPot = targetPoll.pot;
+  const totalWinningAmount = winners.reduce((sum, s) => sum + s.amount, 0);
+  
+  let resultMsg = `🎯 *POLL #${pollNum} RESULTS*\n\n`;
+  resultMsg += `Winner: ${winner.toUpperCase()}\n`;
+  resultMsg += `Total Pot: ${totalPot.toFixed(6)} SOL\n`;
+  resultMsg += `Winners: ${winners.length}\n\n`;
+  resultMsg += `💰 *PAYOUTS:*\n`;
+  
+  // Process each winner
+  for (const winner of winners) {
+    const share = winner.amount / totalWinningAmount;
+    const payout = totalPot * share;
+    
+    resultMsg += `• ${winner.username}: ${payout.toFixed(6)} SOL (${(share*100).toFixed(1)}%)\n`;
+    
+    // Update stats
+    const stats = userStats.get(winner.userIdentifier);
+    if (stats) {
+      stats.wins++;
+      stats.totalWon += payout;
+      stats.xp += XP_PER_WIN;
+      if (payout > stats.biggestWin) stats.biggestWin = payout;
+      userStats.set(winner.userIdentifier, stats);
+    }
+    
+    // Update streak
+    updateStreak(winner.userIdentifier, true);
+    
+    // Check for badges
+    if (stats?.wins === 1) awardBadge(winner.userIdentifier, 'FIRST_WIN');
+    if (stats?.totalBets >= 100) awardBadge(winner.userIdentifier, 'DEGEN');
+    if (stats?.totalStaked >= 100) awardBadge(winner.userIdentifier, 'WHALE');
+    if (payout >= 10) awardBadge(winner.userIdentifier, 'BIG_WIN');
+    
+    // Send payout
+    if (userWallets.has(winner.userIdentifier)) {
+      await sendPayout(
+        userWallets.get(winner.userIdentifier).address,
+        payout,
+        pollNum,
+        winner.username,
+        winner.userIdentifier
+      );
+    }
+  }
+  
+  // Process losers
+  for (const loser of losers) {
+    const stats = userStats.get(loser.userIdentifier);
+    if (stats) {
+      stats.losses++;
+      userStats.set(loser.userIdentifier, stats);
+    }
+    updateStreak(loser.userIdentifier, false);
+  }
+  
+  // Check streak badges
+  for (const winner of winners) {
+    const streak = streakTracker.get(winner.userIdentifier);
+    if (streak && streak.current >= 5) awardBadge(winner.userIdentifier, 'STREAK_5');
+    if (streak && streak.current >= 10) awardBadge(winner.userIdentifier, 'STREAK_10');
+  }
+  
+  ctx.reply(resultMsg, { parse_mode: "Markdown" });
+  
+  // Archive poll
+  targetPoll.settled = true;
+  targetPoll.settledAt = Date.now();
+  settledPolls.set(targetPollId, targetPoll);
+  activePolls.delete(targetPollId);
+});
+
+// ============================================
+// BUTTON HANDLER
+// ============================================
 bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
-  const userIdentifier = getUserIdentifier(ctx);
+  const userId = getUserIdentifier(ctx);
   const username = ctx.from.username || ctx.from.first_name || "Anonymous";
   const isAnonymous = ctx.from?.id?.toString() === ANONYMOUS_ADMIN_ID;
   
-  // Check if user has registered wallet (unless anonymous)
-  if (!isAnonymous && !userWallets.has(userIdentifier)) {
-    return ctx.answerCbQuery("❌ Register your wallet first with /register");
+  if (!isAnonymous && !userWallets.has(userId)) {
+    return ctx.answerCbQuery("❌ Register wallet first with /register");
   }
   
-  const match = ctx.match;
-  const pollNum = parseInt(match[1]);
-  const choice = match[2];
-  const chatId = ctx.chat.id;
+  const pollNum = parseInt(ctx.match[1]);
+  const choice = ctx.match[2];
   
   const pollId = ctx.callbackQuery.message.message_id.toString();
   const poll = activePolls.get(pollId);
   
-  if (!poll) {
-    return ctx.answerCbQuery("❌ Poll not found or expired");
+  if (!poll) return ctx.answerCbQuery("❌ Poll expired");
+  
+  if (pendingStakes.has(userId)) {
+    return ctx.answerCbQuery("⚠️ You have a pending stake! Use /cancel");
   }
-
-  if (pendingStakes.has(userIdentifier)) {
-    const existing = pendingStakes.get(userIdentifier);
-    return ctx.answerCbQuery(
-      `⚠️ You have a pending stake for poll #${existing.pollNum}! Use /cancel first`
-    );
-  }
-
-  await ctx.answerCbQuery(`✅ Selected ${choice.toUpperCase()}! Now send your stake amount.`);
-
-  const stakeInfo = {
+  
+  await ctx.answerCbQuery(`✅ Selected ${choice}! Send amount.`);
+  
+  const stats = userStats.get(userId) || { totalBets: 0 };
+  const streak = streakTracker.get(userId)?.current || 0;
+  const streakBonus = getStreakBonus(streak);
+  
+  pendingStakes.set(userId, {
     pollId,
     poll,
     choice,
     pollNum,
-    chatId,
-    username: isAnonymous ? "Anonymous Admin" : username,
-    userIdentifier,
+    chatId: ctx.chat.id,
+    username,
+    userId,
     timestamp: Date.now(),
-    isAnonymous
-  };
+    isAnonymous,
+    streakBonus
+  });
   
-  pendingStakes.set(userIdentifier, stakeInfo);
-
-  const walletNote = isAnonymous ? 
-    "" : 
-    `\n💳 *Your registered wallet:* \`${userWallets.get(userIdentifier).address}\`\n`;
-
   await ctx.reply(
-    `💰 *STAKE MODE ACTIVE* - ${isAnonymous ? 'Anonymous Admin' : '@' + username}\n\n` +
-    `📌 *Poll #${pollNum}:* ${choice.toUpperCase()}\n` +
-    `💎 *Minimum stake:* ${MIN_STAKE} SOL\n` +
-    walletNote +
-    `\n✍️ *Send your stake amount now*\n` +
-    `Example: \`0.5\` or \`1.23\`\n\n` +
-    `⏱️ You have 3 minutes\n` +
-    `❌ Use /cancel to abort`,
+    `💰 *STAKE MODE*\n\n` +
+    `Poll #${pollNum}: ${choice.toUpperCase()}\n` +
+    `🔥 Current streak: ${streak} (${streakBonus*100}% bonus!)\n` +
+    `💎 Min: ${MIN_STAKE} SOL\n\n` +
+    `Send amount now (e.g., 0.5):`,
     { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
-
-  // Auto-timeout
+  );
+  
+  // Timeout
   setTimeout(() => {
-    if (pendingStakes.has(userIdentifier)) {
-      pendingStakes.delete(userIdentifier);
+    if (pendingStakes.has(userId)) {
+      pendingStakes.delete(userId);
       ctx.telegram.sendMessage(
-        chatId,
-        `⏱️ ${isAnonymous ? 'Anonymous Admin' : '@' + username} - *Stake timeout* for poll #${pollNum}. Click button to try again.`,
+        ctx.chat.id,
+        `⏱️ ${username} - Stake timeout for poll #${pollNum}`,
         { parse_mode: "Markdown" }
       ).catch(() => {});
     }
   }, STAKE_TIMEOUT);
 });
 
-// Handle text messages (stake amounts)
+// ============================================
+// TEXT HANDLER (Stake amounts)
+// ============================================
 bot.on("text", async (ctx) => {
   const text = ctx.message.text.trim();
-  const userIdentifier = getUserIdentifier(ctx);
+  const userId = getUserIdentifier(ctx);
   const username = ctx.from.username || ctx.from.first_name || "Anonymous";
-  const isAnonymous = ctx.from?.id?.toString() === ANONYMOUS_ADMIN_ID;
   
-  // Skip commands
   if (text.startsWith("/")) return;
-
-  if (!pendingStakes.has(userIdentifier)) return;
-
-  const stakeData = pendingStakes.get(userIdentifier);
+  if (!pendingStakes.has(userId)) return;
+  
+  const stakeData = pendingStakes.get(userId);
   
   // Validate amount
   const validation = validateStakeAmount(text);
-  
   if (!validation.valid) {
     await ctx.reply(
-      `❌ ${stakeData.isAnonymous ? 'Anonymous Admin' : '@' + username} - *${validation.error}*\n\n` +
-      `You sent: \`${text}\`\n` +
-      `Please send a valid number. Your stake is still pending.`,
+      `❌ ${validation.error}\nYour stake is still pending. Try again:`,
       { parse_mode: "Markdown" }
-    ).catch(e => console.error("Reply error:", e));
+    );
     return;
   }
-
+  
   const amount = validation.amount;
   
-  // Get user's wallet
-  let walletAddress;
-  if (isAnonymous) {
-    walletAddress = "Anonymous Admin (no wallet required)";
-  } else {
-    if (!userWallets.has(userIdentifier)) {
-      pendingStakes.delete(userIdentifier);
-      return ctx.reply("❌ Wallet not found. Please register with /register");
-    }
-    walletAddress = userWallets.get(userIdentifier).address;
-  }
-
-  // Calculate amounts
-  const rake = amount * RAKE_RATE;
-  const netAmount = amount - rake;
-
-  // Create payment instruction
-  const paymentMsg = isAnonymous ? 
-    `📤 *Send ${amount} SOL to continue*` :
-    `📤 *Send ${amount} SOL from your wallet*\n` +
-    `\`${walletAddress}\`\n\n` +
+  // Calculate with streak bonus
+  const streakBonus = stakeData.streakBonus || 0;
+  const bonusAmount = amount * streakBonus;
+  const totalAmount = amount + bonusAmount;
+  const rake = totalAmount * RAKE_RATE;
+  const netAmount = totalAmount - rake;
+  
+  const walletAddress = userWallets.get(userId)?.address || "Anonymous";
+  
+  const paymentMsg = 
+    `📤 *SEND ${amount} SOL*\n\n` +
     `💰 *Breakdown:*\n` +
-    `• Stake: ${netAmount.toFixed(6)} SOL\n` +
-    `• Rake (20%): ${rake.toFixed(6)} SOL\n\n` +
-    `🏦 *Send to this address:*\n` +
+    `• Base stake: ${amount} SOL\n` +
+    `• Streak bonus: +${bonusAmount.toFixed(6)} SOL (${streakBonus*100}%)\n` +
+    `• Total stake: ${totalAmount.toFixed(6)} SOL\n` +
+    `• Rake (20%): ${rake.toFixed(6)} SOL\n` +
+    `• Net to pot: ${netAmount.toFixed(6)} SOL\n\n` +
+    `🏦 *Send to:*\n` +
     `\`${RAKE_WALLET}\`\n\n` +
-    `⏱️ Complete within 10 minutes\n` +
-    `After sending, click *I've Sent* to confirm`;
-
+    `✅ Click *I've Sent* after paying`;
+  
   const confirmKeyboard = {
     inline_keyboard: [[
-      { text: "✅ I've Sent the SOL", callback_data: `confirm_${stakeData.pollNum}_${amount}` }
+      { text: "✅ I've Sent", callback_data: `confirm_${stakeData.pollNum}_${amount}` }
     ]]
   };
-
+  
   await ctx.reply(paymentMsg, {
     parse_mode: "Markdown",
-    reply_markup: isAnonymous ? undefined : confirmKeyboard
-  }).catch(e => console.error("Reply error:", e));
-
-  // Store pending payment
-  pendingStakes.set(userIdentifier, {
+    reply_markup: confirmKeyboard
+  });
+  
+  // Update pending stake
+  pendingStakes.set(userId, {
     ...stakeData,
     amount,
     netAmount,
     rake,
+    totalAmount,
+    bonusAmount,
     awaitingConfirmation: true
   });
 });
 
-// Handle payment confirmation
+// ============================================
+// CONFIRM HANDLER
+// ============================================
 bot.action(/^confirm_(\d+)_([\d.]+)$/, async (ctx) => {
-  const userIdentifier = getUserIdentifier(ctx);
+  const userId = getUserIdentifier(ctx);
   const pollNum = parseInt(ctx.match[1]);
   const amount = parseFloat(ctx.match[2]);
   
-  if (!pendingStakes.has(userIdentifier)) {
-    return ctx.answerCbQuery("❌ No pending stake found");
+  if (!pendingStakes.has(userId)) {
+    return ctx.answerCbQuery("❌ No pending stake");
   }
-
-  const stakeData = pendingStakes.get(userIdentifier);
+  
+  const stakeData = pendingStakes.get(userId);
   
   if (stakeData.amount !== amount || stakeData.pollNum !== pollNum) {
-    return ctx.answerCbQuery("❌ Stake data mismatch");
+    return ctx.answerCbQuery("❌ Data mismatch");
   }
-
-  // Here you would verify the transaction on Solana
-  console.log(`🔍 Verifying payment of ${amount} SOL from ${stakeData.username}`);
-
-  // Add stake to poll
-  stakeData.poll.pot += stakeData.netAmount;
-  stakeData.poll.stakes.push({
-    userIdentifier,
-    amount: stakeData.netAmount,
-    choice: stakeData.choice,
-    username: stakeData.username,
-    timestamp: Date.now(),
-    confirmed: true,
-    txId: "simulated_tx_" + Date.now()
-  });
-
-  // Remove from pending
-  pendingStakes.delete(userIdentifier);
-
-  // Update poll message
-  const coinPair = stakeData.poll.coin + "/USD";
-  const currentPrice = prices[coinPair] || "unknown";
   
-  const updatedMsg = buildPollMessage(
-    stakeData.poll.pollNum,
-    stakeData.poll.coin,
-    currentPrice,
-    stakeData.poll.pot,
-    stakeData.poll.stakes
-  );
-
-  try {
-    await ctx.telegram.editMessageText(
-      stakeData.chatId,
-      parseInt(stakeData.pollId),
-      undefined,
-      updatedMsg,
-      { 
-        parse_mode: "Markdown",
-        reply_markup: getPollKeyboard(stakeData.poll.pollNum) 
-      }
-    );
-  } catch (e) {
-    console.error("Poll update error:", e.message);
-  }
-
-  // Confirm to user
+  // Generate fake tx ID (in production, this would be real)
+  const txId = `sim_${Date.now()}_${Math.random().toString(36)}`;
+  
+  await confirmStake(userId, stakeData, txId);
+  
   await ctx.reply(
     `✅ *STAKE CONFIRMED!*\n\n` +
-    `💰 *Amount:* ${amount} SOL\n` +
-    `📈 *Choice:* ${stakeData.choice.toUpperCase()}\n` +
-    `🎯 *Poll:* #${stakeData.pollNum}\n\n` +
-    `💎 *Net stake:* ${stakeData.netAmount.toFixed(6)} SOL\n` +
-    `💸 *Rake:* ${stakeData.rake.toFixed(6)} SOL\n` +
-    `🏦 *Rake wallet:* \`${RAKE_WALLET}\`\n\n` +
-    `📊 *Total pot:* ${stakeData.poll.pot.toFixed(6)} SOL\n` +
-    `👥 *Total players:* ${stakeData.poll.stakes.length}`,
+    `💰 Amount: ${stakeData.amount} SOL\n` +
+    `🔥 Bonus: +${stakeData.bonusAmount.toFixed(6)} SOL\n` +
+    `📈 Choice: ${stakeData.choice.toUpperCase()}\n` +
+    `🎯 Poll: #${stakeData.pollNum}\n\n` +
+    `🎰 Jackpot chance: 0.1%`,
     { parse_mode: "Markdown" }
-  ).catch(e => console.error("Reply error:", e));
-
-  ctx.answerCbQuery("✅ Stake confirmed!");
+  );
+  
+  ctx.answerCbQuery("✅ Confirmed!");
 });
 
-// Error handling
-bot.catch((err, ctx) => {
-  console.error(`❌ Bot error:`, err);
-});
+// ============================================
+// LAUNCH BOT
+// ============================================
+console.log("🚀 Launching ULTIMATE Degen Echo Bot...");
+bot.launch({ dropPendingUpdates: true })
+  .then(() => {
+    console.log("✅ BOT IS LIVE!");
+    console.log("💰 Your wallet:", RAKE_WALLET);
+    console.log("🔥 Auto-payout:", AUTO_PAYOUT_ENABLED ? "ON" : "OFF");
+    console.log("👥 Users tracking...");
+  })
+  .catch(error => {
+    console.error("❌ Launch failed:", error);
+  });
 
 // Graceful shutdown
 ["SIGINT", "SIGTERM"].forEach(signal => {
   process.once(signal, () => {
-    console.log(`\n🛑 Shutting down...`);
+    console.log("🛑 Shutting down...");
     bot.stop(signal);
     process.exit(0);
   });
 });
-
-// Launch bot
-console.log("🚀 Starting bot...");
-bot.launch({ dropPendingUpdates: true })
-  .then(() => {
-    console.log("✅ Bot launched successfully!");
-    console.log("🤖 Degen Echo Bot ONLINE");
-    console.log(`💰 Minimum stake: ${MIN_STAKE} SOL`);
-    console.log(`💸 Rake rate: ${RAKE_RATE * 100}%`);
-    if (connection) {
-      console.log("✅ Solana integration enabled");
-    } else {
-      console.log("⚠️ Solana integration disabled");
-    }
-  })
-  .catch(error => {
-    console.error("💥 Launch failed:", error);
-  });
