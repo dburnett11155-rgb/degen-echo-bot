@@ -30,6 +30,7 @@ const prices = {
 // Active polls and pending stakes
 const activePolls = new Map();
 const pendingStakes = new Map();
+const userStakeMode = new Map(); // NEW: Track users waiting to stake
 
 // Initialize bot
 const bot = new Telegraf(BOT_TOKEN);
@@ -78,7 +79,7 @@ let ws = connectPriceWebSocket();
 
 // Helper: Build poll message
 function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
-  let msg = `Degen Echo #${pollNum} – $${coin} at $${price} – next 1H vibe?\n`;
+  let msg = `🎰 Degen Echo #${pollNum} – $${coin} at $${price} – next 1H vibe?\n`;
   msg += `💰 Pot: ${pot.toFixed(6)} SOL\n`;
   
   if (stakes.length > 0) {
@@ -163,12 +164,15 @@ bot.command("chaos", ctx => {
 
 // Command: /cancel
 bot.command("cancel", ctx => {
-  const key = `${ctx.chat.id}_${ctx.from.id}`;
+  const userId = ctx.from.id;
+  const chatId = ctx.chat.id;
+  const key = `${chatId}_${userId}`;
   
-  if (pendingStakes.has(key)) {
+  if (pendingStakes.has(key) || userStakeMode.has(userId)) {
     pendingStakes.delete(key);
+    userStakeMode.delete(userId);
     ctx.reply("✅ Pending stake cancelled");
-    console.log(`🚫 Cancelled stake for ${key}`);
+    console.log(`🚫 Cancelled stake for user ${userId}`);
   } else {
     ctx.reply("No pending stakes to cancel");
   }
@@ -183,7 +187,7 @@ bot.on("callback_query", async ctx => {
     return;
   }
 
-  console.log(`🔘 Button clicked: ${data}`);
+  console.log(`🔘 Button clicked: ${data} by user ${ctx.from.id}`);
 
   const [, pollNumStr, choice] = data.split("_");
   const pollNum = parseInt(pollNumStr);
@@ -199,94 +203,109 @@ bot.on("callback_query", async ctx => {
   const key = `${chatId}_${userId}`;
 
   // Check for existing pending stake
-  if (pendingStakes.has(key)) {
+  if (pendingStakes.has(key) || userStakeMode.has(userId)) {
     return ctx.answerCbQuery("⚠️ You have a pending stake! Use /cancel first");
   }
 
   await ctx.answerCbQuery();
 
-  // Ask for stake amount
-  const prompt = await ctx.reply(
-    `💰 How much SOL to stake on *${choice.toUpperCase()}* for poll #${pollNum}?\n\n` +
-    `Reply with amount (min: 0.001)\nUse /cancel to abort`,
-    { 
-      parse_mode: "Markdown",
-      reply_markup: { force_reply: true, selective: true }
-    }
-  );
-
-  // Store pending stake
-  pendingStakes.set(key, {
+  // Store pending stake BEFORE sending prompt
+  const stakeInfo = {
     pollId,
     poll,
     choice,
     pollNum,
     chatId,
-    promptMsgId: prompt.message_id,
     timestamp: Date.now()
-  });
+  };
+  
+  pendingStakes.set(key, stakeInfo);
+  userStakeMode.set(userId, stakeInfo); // DUAL TRACKING
 
-  console.log(`⏳ Waiting for stake from user ${userId} in chat ${chatId}`);
+  console.log(`⏳ User ${userId} entering stake mode for poll #${pollNum}, choice: ${choice}`);
+
+  // Ask for stake amount - SIMPLER MESSAGE
+  const prompt = await ctx.reply(
+    `💰 *STAKE MODE ACTIVE*\n\n` +
+    `Poll #${pollNum}: ${choice.toUpperCase()}\n` +
+    `Send your stake amount in SOL (min: 0.001)\n\n` +
+    `Example: 0.5\n` +
+    `Use /cancel to abort`,
+    { parse_mode: "Markdown" }
+  );
+
+  stakeInfo.promptMsgId = prompt.message_id;
 
   // Auto-timeout after 3 minutes
   setTimeout(() => {
-    if (pendingStakes.has(key)) {
+    if (pendingStakes.has(key) || userStakeMode.has(userId)) {
       pendingStakes.delete(key);
+      userStakeMode.delete(userId);
       ctx.telegram.sendMessage(
         chatId,
         `⏱️ Stake timeout for poll #${pollNum}. Tap button to retry.`
       ).catch(e => console.error("Timeout notify error:", e));
-      console.log(`⌛ Timeout for ${key}`);
+      console.log(`⌛ Timeout for user ${userId}`);
     }
   }, STAKE_TIMEOUT);
 });
 
-// Handle all messages (catches stake amounts)
-bot.on("message", async ctx => {
-  // Skip commands
-  if (ctx.message.text && ctx.message.text.startsWith("/")) {
-    return;
-  }
-
+// Handle TEXT messages - THIS IS THE CRITICAL FIX
+bot.on("text", async ctx => {
+  const text = ctx.message.text;
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
   const key = `${chatId}_${userId}`;
 
-  console.log(`📩 Message from ${userId}: ${ctx.message.text || "[non-text]"}`);
+  console.log(`📩 TEXT from user ${userId} in chat ${chatId}: "${text}"`);
 
-  // Check if user has pending stake
-  if (!pendingStakes.has(key)) {
-    console.log(`   No pending stake for ${key}`);
+  // Skip commands
+  if (text.startsWith("/")) {
+    console.log(`   Skipping command: ${text}`);
     return;
   }
 
-  const stakeData = pendingStakes.get(key);
+  // Check BOTH tracking systems
+  const hasPending = pendingStakes.has(key);
+  const hasStakeMode = userStakeMode.has(userId);
   
-  // Verify reply in group chats
-  if (ctx.message.reply_to_message && 
-      ctx.message.reply_to_message.message_id !== stakeData.promptMsgId) {
-    console.log(`   Reply to wrong message, ignoring`);
+  console.log(`   Pending stake: ${hasPending}, Stake mode: ${hasStakeMode}`);
+
+  if (!hasPending && !hasStakeMode) {
+    console.log(`   No stake pending for this user`);
     return;
   }
 
-  pendingStakes.delete(key);
-
-  if (!ctx.message.text) {
-    return ctx.reply("❌ Please send a number");
+  // Get stake data from either source
+  const stakeData = pendingStakes.get(key) || userStakeMode.get(userId);
+  
+  if (!stakeData) {
+    console.log(`   ERROR: Found pending flag but no stake data!`);
+    return;
   }
 
-  const amount = parseFloat(ctx.message.text.trim());
+  // Clean up tracking
+  pendingStakes.delete(key);
+  userStakeMode.delete(userId);
+
+  console.log(`   Processing stake for poll #${stakeData.pollNum}, choice: ${stakeData.choice}`);
+
+  // Parse amount
+  const amount = parseFloat(text.trim());
 
   if (isNaN(amount) || amount <= 0) {
-    console.log(`❌ Invalid amount: ${ctx.message.text}`);
-    return ctx.reply("❌ Invalid amount. Tap button to try again.");
+    console.log(`   ❌ Invalid amount: ${text}`);
+    return ctx.reply(
+      `❌ Invalid amount: "${text}"\n\n` +
+      `Please tap the button again and enter a valid number.`
+    );
   }
 
   if (amount < 0.001) {
-    return ctx.reply("❌ Minimum stake: 0.001 SOL");
+    return ctx.reply("❌ Minimum stake: 0.001 SOL\n\nTap button to try again.");
   }
 
-  console.log(`✅ Valid stake: ${amount} SOL`);
+  console.log(`   ✅ Valid stake amount: ${amount} SOL`);
 
   // Calculate rake and update poll
   const rake = amount * RAKE_RATE;
@@ -300,6 +319,9 @@ bot.on("message", async ctx => {
     username: ctx.from.username || ctx.from.first_name || "Anon"
   });
 
+  console.log(`   💰 Added ${netAmount} SOL to pot (after ${rake.toFixed(6)} rake)`);
+  console.log(`   📊 New pot total: ${stakeData.poll.pot.toFixed(6)} SOL`);
+
   // Update poll message
   const coinPair = stakeData.poll.coin + "/USD";
   const currentPrice = prices[coinPair] || "unknown";
@@ -312,23 +334,32 @@ bot.on("message", async ctx => {
     stakeData.poll.stakes
   );
 
-  await ctx.telegram.editMessageText(
-    stakeData.chatId,
-    stakeData.pollId,
-    undefined,
-    updatedMsg,
-    { reply_markup: getPollKeyboard(stakeData.poll.pollNum) }
-  ).catch(e => console.error("Poll update error:", e));
+  try {
+    await ctx.telegram.editMessageText(
+      stakeData.chatId,
+      stakeData.pollId,
+      undefined,
+      updatedMsg,
+      { reply_markup: getPollKeyboard(stakeData.poll.pollNum) }
+    );
+    console.log(`   ✅ Poll message updated successfully`);
+  } catch (e) {
+    console.error(`   ❌ Poll update error:`, e.message);
+  }
 
   // Confirm to user
   await ctx.reply(
-    `✅ Staked ${amount} SOL on *${stakeData.choice.toUpperCase()}* for poll #${stakeData.pollNum}!\n\n` +
-    `💰 Total pot: ${stakeData.poll.pot.toFixed(6)} SOL\n` +
-    `📊 Rake (20%): ${rake.toFixed(6)} SOL → ||${RAKE_WALLET}||`,
+    `✅ *STAKE CONFIRMED!*\n\n` +
+    `Amount: ${amount} SOL\n` +
+    `Choice: ${stakeData.choice.toUpperCase()}\n` +
+    `Poll: #${stakeData.pollNum}\n\n` +
+    `💰 Your net stake: ${netAmount.toFixed(6)} SOL\n` +
+    `📊 Total pot: ${stakeData.poll.pot.toFixed(6)} SOL\n` +
+    `💸 Rake (20%): ${rake.toFixed(6)} SOL → ||${RAKE_WALLET}||`,
     { parse_mode: "Markdown" }
   );
 
-  console.log(`💰 Stake processed: ${amount} SOL from user ${userId}`);
+  console.log(`   🎉 Stake fully processed for user ${userId}`);
 });
 
 // Graceful shutdown
