@@ -1,78 +1,133 @@
 const { Telegraf } = require("telegraf");
 const WebSocket = require("ws");
 
-// Solana coins (Kraken symbols)
-const solanaCoins = ["SOL/USD", "BONK/USD", "WIF/USD", "JUP/USD"];
-
-// Real-time prices from Kraken WebSocket
-const prices = {
-  "SOL/USD": "unknown",
-  "BONK/USD": "unknown",
-  "WIF/USD": "unknown",
-  "JUP/USD": "unknown"
+// Coin configs (Kraken, OKX, Bybit symbols)
+const coinConfigs = {
+  SOL: { kraken: "SOL/USD", okx: "SOL-USDT", bybit: "SOLUSDT" },
+  BONK: { kraken: "BONK/USD", okx: "BONK-USDT", bybit: "BONKUSDT" },
+  WIF: { kraken: "WIF/USD", okx: "WIF-USDT", bybit: "WIFUSDT" },
+  JUP: { kraken: "JUP/USD", okx: "JUP-USDT", bybit: "JUPUSDT" }
 };
 
-// Per-poll data (message ID → {coin, pot: 0, stakes: []})
+// Real-time prices
+const prices = {
+  SOL: "unknown",
+  BONK: "unknown",
+  WIF: "unknown",
+  JUP: "unknown"
+};
+
+// Per-poll data
 const activePolls = {};
 
-// Rake & stake
+// Rake
 const rakeRate = 0.2;
 const rakeWallet = "9pWyRYfKahQZPTnNMcXhZDDsUV75mHcb2ZpxGqzZsHnK";
 
-const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
+// Current exchange order
+const exchangeOrder = ["kraken", "okx", "bybit"];
+let currentExchangeIndex = 0;
 
-// Connect to Kraken WebSocket
-let ws = new WebSocket("wss://ws.kraken.com");
+// Active WS
+let ws = null;
 
-ws.on("open", () => {
-  console.log("Kraken WebSocket connected");
-  ws.send(JSON.stringify({
-    event: "subscribe",
-    pair: solanaCoins,
-    subscription: { name: "ticker" }
-  }));
-});
-
-ws.on("message", (data) => {
-  try {
-    const message = JSON.parse(data);
-    if (Array.isArray(message) && message[1] && message[1].c) {
-      const pair = message[3];
-      const price = message[1].c[0];
-      if (solanaCoins.includes(pair)) {
-        prices[pair] = Number(price).toFixed(6);
+// Connect to current exchange
+function connectWS() {
+  const currentExchange = exchangeOrder[currentExchangeIndex];
+  const config = {
+    kraken: {
+      url: "wss://ws.kraken.com",
+      subscribe: {
+        event: "subscribe",
+        pair: Object.values(coinConfigs).map(c => c.kraken),
+        subscription: { name: "ticker" }
+      },
+      parse: (msg) => {
+        if (Array.isArray(msg) && msg[1] && msg[1].c) {
+          const pair = msg[3];
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].kraken === pair);
+          if (coin) prices[coin] = Number(msg[1].c[0]).toFixed(6);
+        }
+      }
+    },
+    okx: {
+      url: "wss://ws.okx.com:8443/ws/v5/public",
+      subscribe: {
+        op: "subscribe",
+        args: Object.values(coinConfigs).map(c => ({ channel: "tickers", instId: c.okx }))
+      },
+      parse: (msg) => {
+        if (msg.data && msg.arg && msg.arg.channel === "tickers") {
+          const instId = msg.arg.instId;
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].okx === instId);
+          if (coin && msg.data[0] && msg.data[0].last) {
+            prices[coin] = Number(msg.data[0].last).toFixed(6);
+          }
+        }
+      }
+    },
+    bybit: {
+      url: "wss://stream.bybit.com/v5/public/spot",
+      subscribe: {
+        op: "subscribe",
+        args: Object.values(coinConfigs).map(c => "tickers." + c.bybit)
+      },
+      parse: (msg) => {
+        if (msg.topic && msg.data && msg.data.lastPrice) {
+          const symbol = msg.topic.split(".")[2];
+          const coin = Object.keys(coinConfigs).find(k => coinConfigs[k].bybit === symbol);
+          if (coin) prices[coin] = Number(msg.data.lastPrice).toFixed(6);
+        }
       }
     }
-  } catch (e) {
-    console.error("WebSocket parse error:", e.message);
-  }
-});
+  };
 
-ws.on("error", (error) => console.error("Kraken WS error:", error.message));
+  const currentConfig = config[currentExchange];
+  if (!currentConfig) return;
 
-ws.on("close", () => {
-  console.log("Kraken WS closed – reconnecting in 5s...");
-  setTimeout(() => {
-    ws = new WebSocket("wss://ws.kraken.com");
-    ws.on("open", () => { /* same */ });
-    ws.on("message", (data) => { /* same */ });
-    ws.on("error", (error) => { /* same */ });
-    ws.on("close", () => { /* same */ });
-  }, 5000);
-});
+  if (ws) ws.close();
+
+  ws = new WebSocket(currentConfig.url);
+
+  ws.on("open", () => {
+    console.log(`${currentExchange} WebSocket connected`);
+    ws.send(JSON.stringify(currentConfig.subscribe));
+  });
+
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data);
+      currentConfig.parse(msg);
+    } catch (e) {
+      console.error(`${currentExchange} parse error:`, e.message);
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error(`${currentExchange} WS error:`, error.message);
+  });
+
+  ws.on("close", () => {
+    console.log(`${currentExchange} WS closed – switching to next...`);
+    currentExchangeIndex = (currentExchangeIndex + 1) % exchangeOrder.length;
+    connectWS();
+  });
+}
+
+// Start with Kraken
+connectWS();
 
 // /start
 bot.start((ctx) => ctx.reply("Degen Echo Bot online! /poll to start 4 polls (tap to vote & stake your amount)"));
 
-// /poll – creates 4 separate button polls with Kraken prices
+// /poll – creates 4 separate button polls with real-time prices
 bot.command("poll", async (ctx) => {
   ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
-  for (let i = 0; i < solanaCoins.length; i++) {
-    const pair = solanaCoins[i];
-    const coin = pair.replace("/USD", "");
+  for (let i = 0; i < Object.keys(coinConfigs).length; i++) {
+    const coin = Object.keys(coinConfigs)[i];
     const pollNumber = i + 1;
-    const price = prices[pair] || "unknown";
+    const price = prices[coin] || "unknown";
 
     const message = await ctx.reply(`Degen Echo #${pollNumber} – \[ {coin} at \]{price} – next 1H vibe?\nPot: 0 SOL`, {
       reply_markup: {
@@ -130,7 +185,7 @@ bot.on("callback_query", async (ctx) => {
       ctx.chat.id,
       pollId,
       undefined,
-      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pair] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+      `Degen Echo #${pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin] || "unknown"} – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
       {
         reply_markup: ctx.callbackQuery.message.reply_markup
       }
