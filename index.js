@@ -33,57 +33,64 @@ const bot = new Telegraf("8594205098:AAG_KeTd1T4jC5Qz-xXfoaprLiEO6Mnw_1o");
 // Initialize context storage
 bot.context = {};
 
-// Connect to Kraken WebSocket
-let ws = new WebSocket("wss://ws.kraken.com");
+// WebSocket connection function
+function connectWebSocket() {
+  const ws = new WebSocket("wss://ws.kraken.com");
 
-ws.on("open", () => {
-  console.log("Kraken WS connected");
-  ws.send(JSON.stringify({
-    event: "subscribe",
-    pair: solanaCoins,
-    subscription: { name: "ticker" }
-  }));
-});
+  ws.on("open", () => {
+    console.log("Kraken WS connected");
+    ws.send(JSON.stringify({
+      event: "subscribe",
+      pair: solanaCoins,
+      subscription: { name: "ticker" }
+    }));
+  });
 
-ws.on("message", (data) => {
-  try {
-    const message = JSON.parse(data);
-    if (Array.isArray(message) && message[1] && message[1].c) {
-      const pair = message[3];
-      const price = message[1].c[0];
-      if (solanaCoins.includes(pair)) {
-        prices[pair] = Number(price).toFixed(6);
+  ws.on("message", (data) => {
+    try {
+      const message = JSON.parse(data);
+      if (Array.isArray(message) && message[1] && message[1].c) {
+        const pair = message[3];
+        const price = message[1].c[0];
+        if (solanaCoins.includes(pair)) {
+          prices[pair] = Number(price).toFixed(6);
+        }
       }
+    } catch (e) {
+      console.error("WS parse error:", e.message);
     }
-  } catch (e) {
-    console.error("WS parse error:", e.message);
-  }
-});
+  });
 
-ws.on("error", (error) => console.error("Kraken WS error:", error.message));
+  ws.on("error", (error) => {
+    console.error("Kraken WS error:", error.message);
+  });
 
-ws.on("close", () => {
-  console.log("Kraken WS closed – reconnecting in 5s...");
-  setTimeout(() => {
-    ws = new WebSocket("wss://ws.kraken.com");
-    ws.on("open", () => {});
-    ws.on("message", (data) => {});
-    ws.on("error", (error) => {});
-    ws.on("close", () => {});
-  }, 5000);
-});
+  ws.on("close", () => {
+    console.log("Kraken WS closed – reconnecting in 5s...");
+    setTimeout(() => {
+      connectWebSocket();
+    }, 5000);
+  });
 
-// Helper function to build poll message (no template literals - concatenation only)
-function buildPollMessage(pollNumber, coin, price) {
+  return ws;
+}
+
+// Initialize WebSocket connection
+let ws = connectWebSocket();
+
+// Helper function to build poll message
+function buildPollMessage(pollNumber, coin, price, pot) {
   var part1 = "Degen Echo #";
   var part2 = pollNumber.toString();
   var part3 = " – $";
   var part4 = coin;
   var part5 = " at $";
   var part6 = price;
-  var part7 = " – next 1H vibe?\nPot: 0 SOL";
+  var part7 = " – next 1H vibe?\nPot: ";
+  var part8 = pot.toFixed(6);
+  var part9 = " SOL";
 
-  return part1 + part2 + part3 + part4 + part5 + part6 + part7;
+  return part1 + part2 + part3 + part4 + part5 + part6 + part7 + part8 + part9;
 }
 
 // /start
@@ -93,34 +100,50 @@ bot.start((ctx) => {
 
 // /poll
 bot.command("poll", async (ctx) => {
-  ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
+  try {
+    await ctx.reply("Starting 4 separate polls for SOL, BONK, WIF, and JUP! Tap to vote & stake");
 
-  for (let i = 0; i < solanaCoins.length; i++) {
-    const pair = solanaCoins[i];
-    const coin = pair.replace("/USD", "");
-    const pollNumber = i + 1;
-    const price = prices[pair] || "unknown";
+    for (let i = 0; i < solanaCoins.length; i++) {
+      const pair = solanaCoins[i];
+      const coin = pair.replace("/USD", "");
+      const pollNumber = i + 1;
+      const price = prices[pair] || "unknown";
 
-    const pollText = buildPollMessage(pollNumber, coin, price);
+      const pollText = buildPollMessage(pollNumber, coin, price, 0);
 
-    const message = await ctx.reply(pollText, {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "🚀 Pump", callback_data: "vote_" + pollNumber + "_pump" },
-            { text: "📉 Dump", callback_data: "vote_" + pollNumber + "_dump" },
-            { text: "🟡 Stagnate", callback_data: "vote_" + pollNumber + "_stagnate" }
+      const message = await ctx.reply(pollText, {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🚀 Pump", callback_data: "vote_" + pollNumber + "_pump" },
+              { text: "📉 Dump", callback_data: "vote_" + pollNumber + "_dump" },
+              { text: "🟡 Stagnate", callback_data: "vote_" + pollNumber + "_stagnate" }
+            ]
           ]
-        ]
-      }
-    });
+        }
+      });
 
-    activePolls[message.message_id] = {
-      coin,
-      pollNumber,
-      pot: 0,
-      stakes: []
-    };
+      activePolls[message.message_id] = {
+        coin: coin,
+        pollNumber: pollNumber,
+        pot: 0,
+        stakes: []
+      };
+    }
+  } catch (error) {
+    console.error("Poll command error:", error);
+    ctx.reply("Error creating polls. Please try again.").catch(() => {});
+  }
+});
+
+// /chaos
+bot.command("chaos", (ctx) => {
+  try {
+    const score = Math.floor(Math.random() * 100) + 1;
+    const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
+    ctx.reply("Chaos Score: " + score + "/100 – Vibe: " + vibe);
+  } catch (error) {
+    console.error("Chaos command error:", error);
   }
 });
 
@@ -128,7 +151,10 @@ bot.command("poll", async (ctx) => {
 bot.on("callback_query", async (ctx) => {
   try {
     const data = ctx.callbackQuery.data;
-    if (!data.startsWith("vote_")) return;
+    if (!data.startsWith("vote_")) {
+      await ctx.answerCbQuery();
+      return;
+    }
 
     const parts = data.split("_");
     const pollNumber = parseInt(parts[1]);
@@ -136,7 +162,9 @@ bot.on("callback_query", async (ctx) => {
     const pollId = ctx.callbackQuery.message.message_id;
     const pollData = activePolls[pollId];
 
-    if (!pollData) return ctx.answerCbQuery("Poll expired");
+    if (!pollData) {
+      return ctx.answerCbQuery("Poll expired or not found");
+    }
 
     const userId = ctx.callbackQuery.from.id;
     const chatId = ctx.chat.id;
@@ -151,8 +179,16 @@ bot.on("callback_query", async (ctx) => {
       pollData: pollData,
       choice: choice,
       pollNumber: pollNumber,
-      chatId: chatId
+      chatId: chatId,
+      timestamp: Date.now()
     };
+
+    // Auto-clear context after 5 minutes to prevent memory leaks
+    setTimeout(() => {
+      if (bot.context[waitKey] && bot.context[waitKey].timestamp === bot.context[waitKey].timestamp) {
+        delete bot.context[waitKey];
+      }
+    }, 300000);
 
   } catch (error) {
     console.error("Callback query error:", error);
@@ -160,13 +196,14 @@ bot.on("callback_query", async (ctx) => {
   }
 });
 
-// Handle stake amount replies
+// Handle stake amount replies (MUST come after all commands)
 bot.on("text", async (ctx) => {
   try {
     const userId = ctx.from.id;
     const chatId = ctx.chat.id;
     const waitKey = chatId + "_" + userId;
 
+    // Skip if no pending stake for this user
     if (!bot.context[waitKey]) return;
 
     const stakeData = bot.context[waitKey];
@@ -174,45 +211,78 @@ bot.on("text", async (ctx) => {
 
     const amount = parseFloat(ctx.message.text.trim());
 
-    if (!amount || amount <= 0) {
-      return ctx.reply("Invalid amount – try again");
+    if (isNaN(amount) || amount <= 0) {
+      return ctx.reply("Invalid amount – please enter a valid number greater than 0");
     }
 
     const rake = amount * rakeRate;
-    stakeData.pollData.pot += amount;
-    stakeData.pollData.stakes.push({ userId: userId, amount: amount });
+    const netAmount = amount - rake;
+    
+    stakeData.pollData.pot += netAmount;
+    stakeData.pollData.stakes.push({ 
+      userId: userId, 
+      amount: netAmount,
+      choice: stakeData.choice,
+      username: ctx.from.username || ctx.from.first_name || "Anonymous"
+    });
 
     const coinPair = stakeData.pollData.coin + "/USD";
     const currentPrice = prices[coinPair] || "unknown";
     
-    const updatedText = "Degen Echo #" + stakeData.pollData.pollNumber + " – $" + stakeData.pollData.coin + " at $" + currentPrice + " – next 1H vibe?\nPot: " + stakeData.pollData.pot.toFixed(6) + " SOL";
+    const updatedText = buildPollMessage(
+      stakeData.pollData.pollNumber, 
+      stakeData.pollData.coin, 
+      currentPrice, 
+      stakeData.pollData.pot
+    );
 
     await ctx.telegram.editMessageText(
       stakeData.chatId,
       stakeData.pollId,
       undefined,
       updatedText,
-      { reply_markup: { inline_keyboard: [[
-        { text: "🚀 Pump", callback_data: "vote_" + stakeData.pollNumber + "_pump" },
-        { text: "📉 Dump", callback_data: "vote_" + stakeData.pollNumber + "_dump" },
-        { text: "🟡 Stagnate", callback_data: "vote_" + stakeData.pollNumber + "_stagnate" }
-      ]] }}
-    );
+      { 
+        reply_markup: { 
+          inline_keyboard: [[
+            { text: "🚀 Pump", callback_data: "vote_" + stakeData.pollNumber + "_pump" },
+            { text: "📉 Dump", callback_data: "vote_" + stakeData.pollNumber + "_dump" },
+            { text: "🟡 Stagnate", callback_data: "vote_" + stakeData.pollNumber + "_stagnate" }
+          ]] 
+        }
+      }
+    ).catch((error) => {
+      console.error("Error updating poll message:", error.message);
+    });
 
-    await ctx.reply("Staked " + amount + " SOL on " + stakeData.choice + " for poll #" + stakeData.pollNumber + "! Pot now: " + stakeData.pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
+    await ctx.reply(
+      "✅ Staked " + amount + " SOL on " + stakeData.choice + " for poll #" + stakeData.pollNumber + 
+      "!\n\nPot now: " + stakeData.pollData.pot.toFixed(6) + " SOL\nRake: " + rake.toFixed(6) + 
+      " SOL → " + rakeWallet
+    );
 
   } catch (error) {
     console.error("Text handler error:", error);
+    ctx.reply("Error processing your stake. Please try again.").catch(() => {});
   }
 });
 
-// /chaos
-bot.command("chaos", (ctx) => {
-  const score = Math.floor(Math.random() * 100) + 1;
-  const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
-  ctx.reply("Chaos Score: " + score + "/100 – Vibe: " + vibe);
+// Graceful shutdown
+process.once("SIGINT", () => {
+  console.log("Shutting down gracefully...");
+  bot.stop("SIGINT");
+  if (ws) ws.close();
+});
+
+process.once("SIGTERM", () => {
+  console.log("Shutting down gracefully...");
+  bot.stop("SIGTERM");
+  if (ws) ws.close();
 });
 
 // Launch
-bot.launch();
-console.log("Degen Echo Bot is running");
+bot.launch().then(() => {
+  console.log("Degen Echo Bot is running");
+}).catch((error) => {
+  console.error("Failed to launch bot:", error);
+  process.exit(1);
+});
