@@ -18,9 +18,9 @@ const prices = {
   "JUP/USD": "unknown"
 };
 
-// Active polls and pending stakes - SIMPLIFIED: Track by userId only
+// Active polls and pending stakes - Each user tracked separately
 const activePolls = new Map();
-const pendingStakes = new Map(); // Key is just userId
+const pendingStakes = new Map(); // Key is userId - allows multiple people to stake
 
 // Initialize bot
 const bot = new Telegraf(BOT_TOKEN);
@@ -83,7 +83,12 @@ function buildPollMessage(pollNum, coin, price, pot, stakes = []) {
     for (const [choice, stakeList] of Object.entries(grouped)) {
       const emoji = choice === 'pump' ? '🚀' : choice === 'dump' ? '📉' : '🟡';
       const total = stakeList.reduce((sum, s) => sum + s.amount, 0);
-      msg += `${emoji} ${choice.toUpperCase()}: ${total.toFixed(6)} SOL (${stakeList.length})\n`;
+      msg += `${emoji} ${choice.toUpperCase()}: ${total.toFixed(6)} SOL (${stakeList.length} ${stakeList.length === 1 ? 'player' : 'players'})\n`;
+      
+      // Show individual stakes
+      stakeList.forEach(s => {
+        msg += `  → ${s.username}: ${s.amount.toFixed(6)} SOL\n`;
+      });
     }
   }
   
@@ -103,12 +108,15 @@ function getPollKeyboard(pollNum) {
 
 // Command: /start
 bot.start(ctx => {
-  console.log("▶️ Start command from user", ctx.from.id);
+  console.log("▶️ Start from user", ctx.from.id);
   ctx.reply(
-    "🎰 Degen Echo Bot is live!\n\n" +
-    "Use /poll to create polls\n" +
-    "Use /cancel to abort pending stakes\n" +
-    "Use /debug to see pending stakes"
+    "🎰 Degen Echo Bot - Multi-Player Betting!\n\n" +
+    "📌 How to play:\n" +
+    "1️⃣ Use /poll to create prediction polls\n" +
+    "2️⃣ Each player clicks a button to vote\n" +
+    "3️⃣ Each player sends their stake amount\n" +
+    "4️⃣ Multiple players can bet on same poll!\n\n" +
+    "Use /cancel to abort your pending stake"
   );
 });
 
@@ -119,23 +127,34 @@ bot.command("debug", ctx => {
   console.log("Pending Stakes:", pendingStakes.size);
   
   for (const [userId, value] of pendingStakes.entries()) {
-    console.log(`  User ${userId}:`, value.pollNum, value.choice);
+    console.log(`  User ${userId}: Poll #${value.pollNum}, ${value.choice}`);
   }
   console.log("===================\n");
   
-  ctx.reply(
-    `📊 Debug:\n` +
-    `Polls: ${activePolls.size}\n` +
-    `Pending: ${pendingStakes.size}`
-  );
+  let msg = `📊 Debug Info:\n`;
+  msg += `Active Polls: ${activePolls.size}\n`;
+  msg += `Pending Stakes: ${pendingStakes.size}\n\n`;
+  
+  if (pendingStakes.size > 0) {
+    msg += `Waiting for stakes from:\n`;
+    for (const [userId, value] of pendingStakes.entries()) {
+      msg += `• User ${userId}\n`;
+    }
+  }
+  
+  ctx.reply(msg);
 });
 
 // Command: /poll
 bot.command("poll", async ctx => {
-  console.log("📊 Poll command from user", ctx.from.id, "in chat", ctx.chat.id);
+  console.log("📊 Poll from user", ctx.from.id, "in chat", ctx.chat.id);
   
   try {
-    await ctx.reply("🚀 Creating 4 polls for SOL, BONK, WIF, JUP! Tap to vote & stake!");
+    await ctx.reply(
+      "🚀 Creating 4 polls for SOL, BONK, WIF, JUP!\n\n" +
+      "👥 Everyone can vote and stake!\n" +
+      "👉 Click a button, then send your stake amount"
+    );
 
     for (let i = 0; i < COINS.length; i++) {
       const pair = COINS[i];
@@ -156,7 +175,7 @@ bot.command("poll", async ctx => {
         chatId: ctx.chat.id
       });
 
-      console.log(`✅ Created poll #${pollNum}, msgId: ${sent.message_id}`);
+      console.log(`✅ Poll #${pollNum}, msgId: ${sent.message_id}`);
     }
   } catch (error) {
     console.error("Poll creation error:", error);
@@ -178,44 +197,46 @@ bot.command("cancel", ctx => {
   console.log(`🚫 Cancel from user ${userId}`);
   
   if (pendingStakes.has(userId)) {
+    const stake = pendingStakes.get(userId);
     pendingStakes.delete(userId);
-    ctx.reply("✅ Pending stake cancelled");
-    console.log(`✅ Cancelled stake for user ${userId}`);
+    ctx.reply(`✅ Cancelled your pending stake for poll #${stake.pollNum}`);
+    console.log(`✅ Cancelled for user ${userId}`);
   } else {
-    ctx.reply("No pending stakes to cancel");
+    ctx.reply("❌ You don't have any pending stakes");
   }
 });
 
-// Handle button clicks - Track by userId ONLY
+// Handle button clicks - Each user can have their own pending stake
 bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
-  console.log(`\n🔘 BUTTON CLICKED`);
+  console.log(`\n🔘 BUTTON from user ${ctx.from.id}`);
   
   const match = ctx.match;
   const pollNum = parseInt(match[1]);
   const choice = match[2];
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
+  const username = ctx.from.username || ctx.from.first_name || "Anon";
   
-  console.log(`User: ${userId}, Chat: ${chatId}`);
-  console.log(`Poll: ${pollNum}, Choice: ${choice}`);
+  console.log(`Poll: ${pollNum}, Choice: ${choice}, User: ${username} (${userId})`);
   
   const pollId = ctx.callbackQuery.message.message_id;
   const poll = activePolls.get(pollId);
   
-  console.log(`Poll ID: ${pollId}, Found: ${!!poll}`);
-
   if (!poll) {
     console.log(`❌ Poll not found!`);
     return ctx.answerCbQuery("❌ Poll not found");
   }
 
-  // Check by userId ONLY
+  // Check if THIS user already has a pending stake
   if (pendingStakes.has(userId)) {
-    console.log(`⚠️ User ${userId} already has pending stake`);
-    return ctx.answerCbQuery("⚠️ You have a pending stake! Use /cancel first");
+    const existing = pendingStakes.get(userId);
+    console.log(`⚠️ User ${userId} has pending stake for poll #${existing.pollNum}`);
+    return ctx.answerCbQuery(
+      `⚠️ You have a pending stake for poll #${existing.pollNum}! Use /cancel first`
+    );
   }
 
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery(`✅ Stake mode activated for ${choice.toUpperCase()}!`);
 
   const stakeInfo = {
     pollId,
@@ -223,80 +244,84 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     choice,
     pollNum,
     chatId,
+    username,
     timestamp: Date.now()
   };
   
-  // Store by userId ONLY
   pendingStakes.set(userId, stakeInfo);
   
-  console.log(`✅ STORED for userId: ${userId}`);
-  console.log(`Map size: ${pendingStakes.size}`);
+  console.log(`✅ STORED for user ${userId} (${username})`);
+  console.log(`Total pending: ${pendingStakes.size}`);
 
   const prompt = await ctx.reply(
-    `💰 *STAKE MODE ACTIVE*\n\n` +
+    `💰 *STAKE MODE ACTIVE* - @${username}\n\n` +
     `Poll #${pollNum}: ${choice.toUpperCase()}\n` +
     `Send your stake amount in SOL (min: 0.001)\n\n` +
     `Example: 0.5\n` +
+    `⏱️ You have 3 minutes\n` +
     `Use /cancel to abort`,
     { parse_mode: "Markdown" }
   );
 
-  console.log(`📤 Sent prompt ${prompt.message_id}\n`);
+  console.log(`📤 Sent prompt to user ${userId}\n`);
 
+  // Auto-timeout after 3 minutes
   setTimeout(() => {
     if (pendingStakes.has(userId)) {
       console.log(`⌛ TIMEOUT for user ${userId}`);
       pendingStakes.delete(userId);
       ctx.telegram.sendMessage(
         chatId,
-        `⏱️ Stake timeout for poll #${pollNum}. Tap button to retry.`
+        `⏱️ @${username} - Stake timeout for poll #${pollNum}. Click button to retry.`
       ).catch(e => console.error("Timeout error:", e));
     }
   }, STAKE_TIMEOUT);
 });
 
-// Handle text messages - Look up by userId ONLY
+// Handle text messages - Each user's stake is tracked independently
 bot.on("text", async (ctx) => {
   const text = ctx.message.text;
   const userId = ctx.from.id;
   const chatId = ctx.chat.id;
+  const username = ctx.from.username || ctx.from.first_name || "Anon";
   
-  console.log(`\n📩 TEXT: "${text}"`);
-  console.log(`User: ${userId}, Chat: ${chatId}`);
+  console.log(`\n📩 TEXT: "${text}" from ${username} (${userId})`);
   
   if (text.startsWith("/")) {
     console.log(`Skipping command`);
     return;
   }
 
-  console.log(`Looking for userId: ${userId}`);
-  console.log(`Pending stakes size: ${pendingStakes.size}`);
-  console.log(`Has userId: ${pendingStakes.has(userId)}`);
+  console.log(`Looking for userId ${userId} in pending stakes...`);
+  console.log(`Pending stakes: ${pendingStakes.size}`);
+  console.log(`Has this user: ${pendingStakes.has(userId)}`);
 
-  // Look up by userId ONLY
   if (!pendingStakes.has(userId)) {
-    console.log(`No pending stake - exiting\n`);
+    console.log(`❌ User ${userId} has no pending stake\n`);
     return;
   }
 
   const stakeData = pendingStakes.get(userId);
   pendingStakes.delete(userId);
   
-  console.log(`✅ Found stake for poll #${stakeData.pollNum}`);
+  console.log(`✅ Found stake for ${username} - Poll #${stakeData.pollNum}`);
 
   const amount = parseFloat(text.trim());
 
   if (isNaN(amount) || amount <= 0) {
-    console.log(`❌ Invalid amount`);
-    return ctx.reply(`❌ Invalid amount: "${text}"\n\nTap button to try again.`);
+    console.log(`❌ Invalid amount from ${username}`);
+    return ctx.reply(
+      `❌ @${username} - Invalid amount: "${text}"\n\n` +
+      `Click button again to retry.`
+    );
   }
 
   if (amount < 0.001) {
-    console.log(`❌ Too small`);
-    return ctx.reply("❌ Minimum stake: 0.001 SOL");
+    console.log(`❌ Amount too small from ${username}`);
+    return ctx.reply(`❌ @${username} - Minimum stake: 0.001 SOL`);
   }
 
-  console.log(`✅ Valid: ${amount} SOL`);
+  console.log(`✅ Valid: ${amount} SOL from ${username}`);
 
   const rake = amount * RAKE_RATE;
   const netAmount = amount - rake;
@@ -306,10 +331,12 @@ bot.on("text", async (ctx) => {
     userId,
     amount: netAmount,
     choice: stakeData.choice,
-    username: ctx.from.username || ctx.from.first_name || "Anon"
+    username: stakeData.username
   });
 
-  console.log(`💰 Pot now: ${stakeData.poll.pot.toFixed(6)} SOL`);
+  console.log(`💰 ${username} added ${netAmount.toFixed(6)} SOL`);
+  console.log(`💰 Total pot: ${stakeData.poll.pot.toFixed(6)} SOL`);
+  console.log(`📊 Total players: ${stakeData.poll.stakes.length}`);
 
   const coinPair = stakeData.poll.coin + "/USD";
   const currentPrice = prices[coinPair] || "unknown";
@@ -330,23 +357,24 @@ bot.on("text", async (ctx) => {
       updatedMsg,
       { reply_markup: getPollKeyboard(stakeData.poll.pollNum) }
     );
-    console.log(`✅ Poll updated`);
+    console.log(`✅ Poll updated with ${username}'s stake`);
   } catch (e) {
     console.error(`❌ Update error:`, e.message);
   }
 
   await ctx.reply(
-    `✅ *STAKE CONFIRMED!*\n\n` +
+    `✅ *STAKE CONFIRMED* - @${username}\n\n` +
     `Amount: ${amount} SOL\n` +
     `Choice: ${stakeData.choice.toUpperCase()}\n` +
     `Poll: #${stakeData.pollNum}\n\n` +
     `💰 Your net stake: ${netAmount.toFixed(6)} SOL\n` +
     `📊 Total pot: ${stakeData.poll.pot.toFixed(6)} SOL\n` +
+    `👥 Total players: ${stakeData.poll.stakes.length}\n` +
     `💸 Rake (20%): ${rake.toFixed(6)} SOL → ||${RAKE_WALLET}||`,
     { parse_mode: "Markdown" }
   );
 
-  console.log(`🎉 COMPLETE!\n`);
+  console.log(`🎉 STAKE COMPLETE for ${username}!\n`);
 });
 
 // Graceful shutdown
@@ -362,9 +390,9 @@ bot.on("text", async (ctx) => {
 // Launch
 bot.launch({ dropPendingUpdates: true })
   .then(() => {
-    console.log("🤖 Degen Echo Bot ONLINE");
+    console.log("🤖 Degen Echo Bot ONLINE - Multi-Player Mode");
     console.log(`📱 @${bot.botInfo.username}`);
-    console.log("✅ Tracking stakes by userId only (fixes group chat issues)\n");
+    console.log("✅ Multiple users can stake on same polls\n");
   })
   .catch(error => {
     console.error("💥 Launch failed:", error);
