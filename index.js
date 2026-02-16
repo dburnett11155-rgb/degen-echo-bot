@@ -10,18 +10,18 @@ const connection = new Connection("https://api.mainnet-beta.solana.com", "confir
 // Pulse history (last 10 vectors [delta, tps, skips])
 let pulseHistory = [];
 
-// Current pulse-derived prices and direction (start from anchors)
+// Current pulse-derived prices and direction (anchor starting point)
 const prices = {
-  SOL: { value: "85.00", direction: "unknown" },
-  BONK: { value: "0.000021", direction: "unknown" },
-  WIF: { value: "1.93", direction: "unknown" },
-  JUP: { value: "0.78", direction: "unknown" }
+  SOL: { value: "89.76", direction: "unknown" },
+  BONK: { value: "0.00000642", direction: "unknown" },
+  WIF: { value: "0.23", direction: "unknown" },
+  JUP: { value: "0.163", direction: "unknown" }
 };
 
 // Stagnate range
 const STAGNATE_RANGE = 0.5;
 
-// Per-poll data (poll message ID → {coin, pot: 0, stakes: []})
+// Per-poll data (message ID → {coin, pot: 0, stakes: []})
 const activePolls = {};
 
 // Rake
@@ -61,13 +61,13 @@ setInterval(async () => {
         velocity = 0;
       } else if (avgTps > 1500 && avgDelta > 0.5) {
         direction = "Pump";
-        velocity = avgTps / 10000; // rough velocity proxy
+        velocity = avgTps / 10000;
       } else if (avgTps < 1000 || avgDelta > 1) {
         direction = "Dump";
         velocity = -avgTps / 10000;
       }
 
-      // Apply velocity to all prices nonstop
+      // Apply velocity to anchored prices nonstop
       for (const coin in prices) {
         const current = Number(prices[coin].value);
         const newPrice = current * (1 + velocity * 0.01);
@@ -138,4 +138,36 @@ bot.on("callback_query", async (ctx) => {
     const amount = parseFloat(replyCtx.message.text.trim());
 
     if (!amount || amount <= 0) {
-      return replyCtx.reply("Invalid amount –
+      return replyCtx.reply("Invalid amount – try again");
+    }
+
+    const rake = amount * rakeRate;
+    pollData.pot += amount;
+    pollData.stakes.push({ userId, amount });
+
+    // Edit poll message to show updated pot
+    await ctx.telegram.editMessageText(
+      ctx.chat.id,
+      pollId,
+      undefined,
+      `Degen Echo #\( {pollData.pollNumber} – \[ {pollData.coin} at \]{prices[pollData.coin].value} ( \){prices[pollData.coin].direction}) – next 1H vibe?\nPot: ${pollData.pot.toFixed(6)} SOL`,
+      {
+        reply_markup: ctx.callbackQuery.message.reply_markup
+      }
+    );
+
+    await replyCtx.reply(`Staked ${amount} SOL on \( {choice} for poll # \){pollNumber}! Pot now: ${pollData.pot.toFixed(6)} SOL (rake: ${rake.toFixed(6)})`);
+    bot.off("text", listener);
+  });
+});
+
+// /chaos – random score
+bot.command("chaos", (ctx) => {
+  const score = Math.floor(Math.random() * 100) + 1;
+  const vibe = score > 70 ? "bullish 🔥" : score < 30 ? "bearish 💀" : "neutral 🤷";
+  ctx.reply(`Chaos Score: ${score}/100 – Vibe: ${vibe}`);
+});
+
+// Launch
+bot.launch();
+console.log("Degen Echo Bot is running");
