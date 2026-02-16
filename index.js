@@ -175,59 +175,51 @@ bot.launch();
 console.log("Degen Echo Bot is running");
 
 
-// Fix for stake reply not working - add scoped collector fallback
-bot.on("callback_query", async (ctx) => {
-  const data = ctx.callbackQuery.data;
-  if (!data.startsWith("vote_")) return;
 
-  const [_, pollNumberStr, choice] = data.split("_");
-  const pollNumber = parseInt(pollNumberStr);
-  const pollId = ctx.callbackQuery.message.message_id;
-  const pollData = activePolls[pollId];
-
-  if (!pollData) return ctx.answerCbQuery("Poll expired");
-
-  const userId = ctx.callbackQuery.from.id;
-
-  await ctx.reply("How much SOL do you want to stake on " + choice + " for poll #" + pollNumber + "? Reply with amount (e.g. 0.001)");
-
-  const filter = m => m.author.id === userId;
-  const collector = ctx.channel.createMessageCollector({ filter, max: 1, time: 60000 });
-
-  collector.on("collect", async m => {
-    const amount = parseFloat(m.content.trim());
-
-    if (!amount || amount <= 0) {
-      return m.reply("Invalid amount – try again");
-    }
-
-    const rake = amount * rakeRate;
-    pollData.pot += amount;
-    pollData.stakes.push({ userId: userId, amount, choice });
-
-    await ctx.telegram.editMessageText(
-      ctx.chat.id,
-      pollId,
-      undefined,
-      "Degen Echo #" + pollData.pollNumber + " – $" + pollData.coin + " at $" + (prices[pair] || "unknown") + " – next 1H vibe?\nPot: " + pollData.pot.toFixed(6) + " SOL",
-      { reply_markup: ctx.callbackQuery.message.reply_markup }
-    );
-
-    await m.reply("Staked " + amount + " SOL on " + choice + " for poll #" + pollNumber + "! Pot now: " + pollData.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
-  });
-
-  collector.on("end", (collected, reason) => {
-    if (reason === "time") {
-      ctx.reply("Stake timed out – try again with /poll");
-    }
-  });
-});
-
-
-// Fallback stake listener - catches replies after prompt
+// Fallback stake handler - catches replies after prompt and updates pot
 bot.on("text", async (ctx) => {
-  if (ctx.message.text.match(/^\d+(\.\d+)?$/)) { // simple check for number like "1" or "0.001"
-    // This is a fallback - in practice, add more logic if needed
-    ctx.reply("Stake received: " + ctx.message.text + " SOL - pot updated (manual check for now)");
+  // Ignore if not a number reply
+  const text = ctx.message.text.trim();
+  if (!text.match(/^\d+(\.\d+)?$/)) return; // only matches numbers like "1" or "0.001"
+
+  const amount = parseFloat(text);
+
+  // Find the most recent poll for this user (simple fallback)
+  let latestPoll = null;
+  let latestTime = 0;
+  for (const pollId in activePolls) {
+    const poll = activePolls[pollId];
+    const hasUserStake = poll.stakes.some(s => s.userId === ctx.message.from.id);
+    if (!hasUserStake && poll.stakes.length === 0) { // assume recent if no stakes yet
+      const messageTime = poll.message_time || 0; // add message_time if you have it, or skip
+      if (messageTime > latestTime) {
+        latestTime = messageTime;
+        latestPoll = poll;
+      }
+    }
   }
+
+  if (!latestPoll) {
+    return ctx.reply("No active poll found for staking – try /poll again");
+  }
+
+  if (amount <= 0) {
+    return ctx.reply("Invalid amount – try again");
+  }
+
+  const rake = amount * rakeRate;
+  latestPoll.pot += amount;
+  latestPoll.stakes.push({ userId: ctx.message.from.id, amount });
+
+  // Update the poll message (use latestPoll.message_id or pollId if you have it)
+  // If you don't have message_id stored, skip update or log it
+  await ctx.telegram.editMessageText(
+    ctx.chat.id,
+    latestPoll.message_id || pollId, // fallback if no message_id stored
+    undefined,
+    "Degen Echo #" + latestPoll.pollNumber + " – $" + latestPoll.coin + " at $" + (prices[latestPoll.coin + "/USD"] || "unknown") + " – next 1H vibe?\nPot: " + latestPoll.pot.toFixed(6) + " SOL",
+    { reply_markup: { inline_keyboard: ctx.message.reply_markup ? ctx.message.reply_markup.inline_keyboard : [] } }
+  );
+
+  ctx.reply("Staked " + amount + " SOL! Pot now: " + latestPoll.pot.toFixed(6) + " SOL (rake: " + rake.toFixed(6) + ")");
 });
