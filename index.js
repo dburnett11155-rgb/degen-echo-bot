@@ -1,6 +1,14 @@
 const { Telegraf } = require("telegraf");
 const { Connection, PublicKey } = require("@solana/web3.js");
 
+// Your anchor prices (current as of February 16, 2026)
+const anchorPrices = {
+  SOL: 85.41,
+  BONK: 0.0000065,
+  WIF: 0.231,
+  JUP: 0.163
+};
+
 // Solana coins
 const solanaCoins = ["SOL", "BONK", "WIF", "JUP"];
 
@@ -10,12 +18,12 @@ const connection = new Connection("https://api.mainnet-beta.solana.com", "confir
 // Pulse history (last 10 vectors [delta, tps, skips])
 let pulseHistory = [];
 
-// Current pulse-derived prices and direction (anchor starting point)
+// Current pulse-derived prices and direction (start from anchors)
 const prices = {
-  SOL: { value: "89.76", direction: "unknown" },
-  BONK: { value: "0.00000642", direction: "unknown" },
-  WIF: { value: "0.23", direction: "unknown" },
-  JUP: { value: "0.163", direction: "unknown" }
+  SOL: { value: anchorPrices.SOL.toFixed(2), direction: "unknown" },
+  BONK: { value: anchorPrices.BONK.toFixed(8), direction: "unknown" },
+  WIF: { value: anchorPrices.WIF.toFixed(3), direction: "unknown" },
+  JUP: { value: anchorPrices.JUP.toFixed(3), direction: "unknown" }
 };
 
 // Stagnate range
@@ -61,13 +69,13 @@ setInterval(async () => {
         velocity = 0;
       } else if (avgTps > 1500 && avgDelta > 0.5) {
         direction = "Pump";
-        velocity = avgTps / 10000;
+        velocity = avgTps / 10000; // rough velocity proxy
       } else if (avgTps < 1000 || avgDelta > 1) {
         direction = "Dump";
         velocity = -avgTps / 10000;
       }
 
-      // Apply velocity to anchored prices nonstop
+      // Apply velocity to all prices nonstop
       for (const coin in prices) {
         const current = Number(prices[coin].value);
         const newPrice = current * (1 + velocity * 0.01);
