@@ -11,8 +11,3 @@ services:
       name: bot-data
       mountPath: /opt/render/project/src/data
       sizeGB: 1
-```
-
-Then in your `.env` or Render environment variables, add:
-```
-DATA_DIR=/opt/render/project/src/data
