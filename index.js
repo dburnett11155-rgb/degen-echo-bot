@@ -5,7 +5,7 @@
  * Fully automated: hourly polls, 19% rake, 80% pot, 1% jackpot,
  * daily rewards, referrals, achievements, tournaments,
  * Phantom wallet (mobile + desktop) + manual send fallback.
- * Includes /envtest and /channeltest for easy debugging.
+ * Includes /envtest, /channeltest, and /chatid for easy debugging.
  */
 
 require("dotenv").config();
@@ -1168,6 +1168,11 @@ bot.command('channeltest', async (ctx) => {
     }
   }
   await ctx.reply(results.join('\n'));
+});
+
+// 🆔 Get numeric chat ID
+bot.command('chatid', (ctx) => {
+  ctx.reply(`Chat ID: ${ctx.chat.id}`);
 });
 
 bot.command('starttournament', async (ctx) => {
