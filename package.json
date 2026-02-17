@@ -21,19 +21,3 @@
     "ws": "^8.18.0"
   }
 }
-```
-
----
-
-### .env.example
-```
-BOT_TOKEN=
-BOT_PRIVATE_KEY=
-RAKE_WALLET=
-ADMIN_TELEGRAM_ID=
-JACKPOT_USDC_WALLET=
-SOLANA_RPC=https://api.mainnet-beta.solana.com
-LIVE_CHANNEL=@degenecholive
-ANNOUNCEMENTS_CHANNEL=@degenechochamber
-COMMUNITY_GROUP=@degenechochat
-PORT=3000
