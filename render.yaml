@@ -3,7 +3,7 @@ services:
     name: degen-echo-bot
     env: node
     buildCommand: npm install
-    startCommand: node degen-echo-fixed.js
+    startCommand: node index.js
     envVars:
       - key: NODE_ENV
         value: production
