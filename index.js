@@ -4,17 +4,8 @@
  * DEGEN ECHO – THE ULTIMATE TELEGRAM BETTING BOT
  * One global poll per hour
  * 19% Rake | 80% Pot | 1% Jackpot (through bot wallet)
- * Full automation + all revolutionary features:
- *   – Referral system
- *   – Daily rewards
- *   – Achievements & badges
- *   – Live price charts
- *   – Community coin voting
- *   – Streak booster
- *   – Whale alerts
- *   – Tournaments
- *   – Multi‑language support
- *   – Provably fair verification
+ * Full automation + all revolutionary features
+ * CANVAS REMOVED – fully compatible with Render
  */
 
 require("dotenv").config();
@@ -33,7 +24,7 @@ const express = require("express");
 const axios = require("axios");
 const cron = require("node-cron");
 const bs58 = require("bs58");
-const { createCanvas } = require("canvas");
+const crypto = require('crypto');
 
 // ============================================
 // CONFIGURATION
@@ -58,17 +49,17 @@ const RAKE_WALLET = process.env.RAKE_WALLET;
 const ADMIN_IDS = [process.env.ADMIN_TELEGRAM_ID, "1087968824"].filter(Boolean);
 
 // Split configuration
-const RAKE_PERCENT = 0.19;        // 19% to rake wallet
-const POT_PERCENT = 0.80;          // 80% to hourly winners
-const JACKPOT_PERCENT = 0.01;      // 1% to jackpot (in bot wallet)
+const RAKE_PERCENT = 0.19;
+const POT_PERCENT = 0.80;
+const JACKPOT_PERCENT = 0.01;
 
 const MIN_STAKE = 0.001;
 const MAX_STAKE = 1000;
-const PAYMENT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const PAYMENT_TIMEOUT_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 5000;
 const PORT = Number(process.env.PORT) || 3000;
 
-// Telegram channels (must be public and bot must be admin)
+// Telegram channels
 const LIVE_CHANNEL = process.env.LIVE_CHANNEL || "@degenecholive";
 const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || "@degenechochamber";
 const COMMUNITY_GROUP = process.env.COMMUNITY_GROUP || "@degenechochat";
@@ -105,7 +96,7 @@ try {
 }
 
 // ============================================
-// IN‑MEMORY STATE (with cleanup)
+// IN‑MEMORY STATE
 // ============================================
 
 let currentPrice = 0;
@@ -114,71 +105,51 @@ let currentPoll = {
   pot: 0,
   stakes: [],
   startTime: Date.now(),
-  endTime: Date.now() + 3600000, // 1 hour
+  endTime: Date.now() + 3600000,
   totalBets: 0,
-  seedHash: null,               // for provably fair
+  seedHash: null,
+  serverSeed: null,
   clientSeed: null,
 };
-const pendingPayments = new Map();      // memoId -> payment details
-const userWallets = new Map();          // userId -> { address, username, refCode, referredBy }
-const processedTxSignatures = new Set(); // tx signatures already processed
-const userStats = new Map();             // userId -> { username, totalBets, totalWon, totalStaked, winStreak, bestStreak, level, xp, badges[], lastDaily, refCount, refEarnings }
+const pendingPayments = new Map();
+const userWallets = new Map();
+const processedTxSignatures = new Set();
+const userStats = new Map();
 
-// Jackpot tracking
 let jackpotAmountSOL = 0;
-let jackpotHistory = [];                // last 10 winners
+let jackpotHistory = [];
 let lastJackpotWin = null;
 
-// Pinned message IDs
 let pollMessageId = null;
 let pollChatId = null;
 let leaderboardMessageId = null;
 let leaderboardChatId = null;
 
-// Rate limiting
 const rateLimitMap = new Map();
 const RATE_LIMIT = 20;
 const RATE_WINDOW_MS = 60 * 1000;
 
-// Referral codes map
-const referralCodes = new Map();         // code -> userId
+const referralCodes = new Map();
+const userDailyStreak = new Map();
 
-// Daily rewards
-const DAILY_REWARDS = [0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.015];
-const userDailyStreak = new Map();       // userId -> { streak, lastClaim }
-
-// Achievements
 const ACHIEVEMENTS = {
   FIRST_BET:   { id: 'first_bet', name: '🎯 First Bet', xp: 10 },
-  HOT_STREAK_5:{ id: 'streak_5', name: '🔥 Hot Streak (5 wins)', xp: 50 },
-  HOT_STREAK_10:{id: 'streak_10', name: '⚡ Unstoppable (10 wins)', xp: 200 },
-  WHALE:       { id: 'whale', name: '🐋 Whale', xp: 500, condition: (stats) => stats.totalStaked >= 100 },
+  HOT_STREAK_5: { id: 'streak_5', name: '🔥 Hot Streak (5 wins)', xp: 50 },
+  HOT_STREAK_10: { id: 'streak_10', name: '⚡ Unstoppable (10 wins)', xp: 200 },
+  WHALE:       { id: 'whale', name: '🐋 Whale', xp: 500 },
   JACKPOT:     { id: 'jackpot', name: '🎰 Jackpot Winner', xp: 1000 },
-  LEGEND:      { id: 'legend', name: '👑 Legend', xp: 2000, condition: (stats) => stats.totalWon >= 100 },
+  LEGEND:      { id: 'legend', name: '👑 Legend', xp: 2000 },
   REFERRER_5:  { id: 'ref5', name: '🤝 Influencer (5 referrals)', xp: 100 },
 };
 
-// Coin voting for next coins
-const coinVotes = new Map();              // coin -> votes
+const coinVotes = new Map();
 const COIN_OPTIONS = ["ETH/USD", "BTC/USD", "BNB/USD", "DOGE/USD", "SHIB/USD"];
 
-// Tournament mode
 let tournamentActive = false;
 let tournamentEndTime = 0;
-const tournamentLeaderboard = new Map();  // userId -> totalWonInTournament
+const tournamentLeaderboard = new Map();
 
-// Language support (simple, can be extended)
-const LANG = {
-  en: {
-    welcome: "Welcome",
-    // ...
-  },
-  es: {
-    welcome: "Bienvenido",
-    // ...
-  }
-};
-let userLang = new Map();                  // userId -> language code
+const userLang = new Map();
 
 // ============================================
 // LOGGER
@@ -193,7 +164,7 @@ const log = {
 };
 
 // ============================================
-// KRAKEN WEBSOCKET (ONLY)
+// KRAKEN WEBSOCKET
 // ============================================
 
 let wsReconnectDelay = 2000;
@@ -308,8 +279,8 @@ function addToJackpot(amountSOL) {
 }
 
 async function tryWinJackpot(userId, username, betAmount) {
-  if (jackpotAmountSOL < 1) return null; // minimum jackpot to win
-  const winChance = tournamentActive ? 0.002 : 0.001; // double chance during tournament
+  if (jackpotAmountSOL < 1) return null;
+  const winChance = tournamentActive ? 0.002 : 0.001;
   if (Math.random() < winChance) {
     const winAmount = jackpotAmountSOL;
     jackpotAmountSOL = 0;
@@ -332,12 +303,9 @@ function generateReferralCode(userId) {
 async function processReferral(refereeId, code) {
   const referrerId = referralCodes.get(code);
   if (!referrerId || referrerId === refereeId) return false;
-  // store referral relation
   const stats = userStats.get(referrerId) || { refCount: 0, refEarnings: 0 };
   stats.refCount = (stats.refCount || 0) + 1;
   userStats.set(referrerId, stats);
-  // award badge if needed
-  checkAndAwardAchievement(referrerId, 'REFERRER_5');
   return true;
 }
 
@@ -355,18 +323,11 @@ function awardAchievement(userId, achievementId) {
   userStats.set(userId, stats);
 }
 
-function checkAndAwardAchievement(userId, achievementId) {
-  const stats = userStats.get(userId);
-  if (!stats) return;
-  const ach = ACHIEVEMENTS[achievementId];
-  if (!ach) return;
-  if (ach.condition && !ach.condition(stats)) return;
-  awardAchievement(userId, achievementId);
-}
-
 // ============================================
 // DAILY REWARDS
 // ============================================
+
+const DAILY_REWARDS = [0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.015];
 
 async function claimDailyReward(userId) {
   const now = Date.now();
@@ -375,14 +336,12 @@ async function claimDailyReward(userId) {
   if (hoursSinceLast < 24) {
     return { success: false, hoursLeft: 24 - hoursSinceLast };
   }
-  // reset streak if missed more than 48 hours
   if (hoursSinceLast > 48) entry.streak = 0;
   entry.streak++;
   if (entry.streak > DAILY_REWARDS.length) entry.streak = DAILY_REWARDS.length;
   entry.lastClaim = now;
   userDailyStreak.set(userId, entry);
   const reward = DAILY_REWARDS[entry.streak - 1];
-  // send reward from bot wallet (must have funds)
   const userData = userWallets.get(userId);
   if (userData) {
     await sendPayout(userId, reward, "Daily reward");
@@ -415,7 +374,6 @@ function startTournament(durationHours = 24) {
 
 function endTournament() {
   tournamentActive = false;
-  // announce winners
   const sorted = [...tournamentLeaderboard.entries()].sort((a,b) => b[1] - a[1]).slice(0,3);
   let msg = `🏆 *Tournament Ended*\n\nTop 3 Winners:\n`;
   sorted.forEach(([userId, won], i) => {
@@ -438,10 +396,9 @@ function hashSeed(seed) {
   return crypto.createHash('sha256').update(seed).digest('hex');
 }
 
-function verifyOutcome(serverSeed, clientSeed, outcome) {
+function verifyOutcome(serverSeed, clientSeed) {
   const combined = serverSeed + clientSeed;
   const hash = crypto.createHash('sha256').update(combined).digest('hex');
-  // outcome is 'pump' if first 2 hex digits > 0x80, etc. (simplified)
   const val = parseInt(hash.substring(0,2), 16);
   if (val < 85) return 'pump';
   if (val < 170) return 'dump';
@@ -662,17 +619,14 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
   const potAmount = amount * POT_PERCENT;
   const jackpotAmount = amount * JACKPOT_PERCENT;
 
-  // Update poll
   currentPoll.pot += potAmount;
   currentPoll.stakes.push({
     userId, username, choice, amount: potAmount, totalAmount: amount, timestamp: Date.now(), signature, memoId
   });
   currentPoll.totalBets++;
 
-  // Add to jackpot
   addToJackpot(jackpotAmount);
 
-  // Update user stats
   let stats = userStats.get(userId) || { username, totalBets:0, totalWon:0, totalStaked:0, winStreak:0, bestStreak:0, xp:0, badges:[] };
   stats.username = username;
   stats.totalBets++;
@@ -680,32 +634,22 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
   stats.xp += 10;
   userStats.set(userId, stats);
 
-  // Check for first bet achievement
   if (stats.totalBets === 1) awardAchievement(userId, 'FIRST_BET');
-
-  // Check for whale achievement
   if (stats.totalStaked >= 100) awardAchievement(userId, 'WHALE');
 
-  // Tournament tracking
   if (tournamentActive) {
     const current = tournamentLeaderboard.get(userId) || 0;
-    tournamentLeaderboard.set(userId, current + potAmount); // winning tracked at settlement
+    tournamentLeaderboard.set(userId, current + potAmount);
   }
 
-  // Streak booster (will be updated on win/loss later)
-  // Not now, after settlement
-
-  // Check for jackpot win
   const jackpotWin = await tryWinJackpot(userId, username, amount);
   if (jackpotWin) {
     awardAchievement(userId, 'JACKPOT');
     await sendPayout(userId, jackpotWin, "Jackpot Win");
   }
 
-  // Send rake to your wallet
   await sendToRakeWallet(rakeAmount);
 
-  // Confirm to user
   const emoji = { pump: "🚀", dump: "📉", stagnate: "🟡" }[choice];
   let confirmMsg = `${emoji} *Bet Confirmed!*\n\n`;
   confirmMsg += `💰 Amount: ${amount} SOL\n🎯 Choice: ${choice.toUpperCase()}\n`;
@@ -715,7 +659,6 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
 
   await bot.telegram.sendMessage(chatId, confirmMsg, { parse_mode: "Markdown" }).catch(()=>{});
 
-  // Whale alert
   if (amount >= 10) {
     bot.telegram.sendMessage(LIVE_CHANNEL, `🐋 *Whale Alert!*\n👤 ${username}\n💰 ${amount} SOL → *${choice.toUpperCase()}*`, { parse_mode: "Markdown" }).catch(()=>{});
   }
@@ -740,12 +683,10 @@ async function settleHour() {
   if (currentPoll.stakes.length === 0) {
     await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, "⏰ No bets this hour.", { parse_mode: "Markdown" }).catch(()=>{});
   } else {
-    // Determine winner (provably fair if seeds set)
     let winnerChoice;
     if (currentPoll.seedHash && currentPoll.clientSeed) {
-      winnerChoice = verifyOutcome(currentPoll.serverSeed, currentPoll.clientSeed, null);
+      winnerChoice = verifyOutcome(currentPoll.serverSeed, currentPoll.clientSeed);
     } else {
-      // fallback to price movement
       if (currentPrice > openPrice * 1.001) winnerChoice = 'pump';
       else if (currentPrice < openPrice * 0.999) winnerChoice = 'dump';
       else winnerChoice = 'stagnate';
@@ -766,7 +707,6 @@ async function settleHour() {
       if (sig) {
         paidAmount += finalPayout;
         paidCount++;
-        // update stats with win
         const stats = userStats.get(w.userId);
         if (stats) {
           stats.totalWon += finalPayout;
@@ -775,10 +715,8 @@ async function settleHour() {
           stats.xp += 50;
           userStats.set(w.userId, stats);
         }
-        // check streak achievements
         if (stats.winStreak >= 5) awardAchievement(w.userId, 'HOT_STREAK_5');
         if (stats.winStreak >= 10) awardAchievement(w.userId, 'HOT_STREAK_10');
-        // tournament leaderboard
         if (tournamentActive) {
           const curr = tournamentLeaderboard.get(w.userId) || 0;
           tournamentLeaderboard.set(w.userId, curr + finalPayout);
@@ -786,14 +724,12 @@ async function settleHour() {
       }
     }
 
-    // losers: reset streak
     const losers = currentPoll.stakes.filter(s => s.choice !== winnerChoice);
     for (const l of losers) {
       const stats = userStats.get(l.userId);
       if (stats) stats.winStreak = 0;
     }
 
-    // announce results
     let resultMsg = `⏰ *Hourly Results*\n\n`;
     resultMsg += `Winner: ${winnerChoice.toUpperCase()}\n`;
     resultMsg += `Pot: ${totalPot.toFixed(6)} SOL\n`;
@@ -803,7 +739,6 @@ async function settleHour() {
     await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, resultMsg, { parse_mode: "Markdown" }).catch(()=>{});
   }
 
-  // Reset poll for next hour
   const newServerSeed = generateSeed();
   currentPoll = {
     pot: 0,
@@ -812,14 +747,13 @@ async function settleHour() {
     endTime: Date.now() + 3600000,
     totalBets: 0,
     seedHash: hashSeed(newServerSeed),
-    serverSeed: newServerSeed, // store temporarily, will be revealed after
+    serverSeed: newServerSeed,
     clientSeed: null,
   };
   openPrice = currentPrice;
   await updatePoll();
   await updateLeaderboard();
 
-  // Check tournament end
   if (tournamentActive && Date.now() >= tournamentEndTime) {
     endTournament();
   }
@@ -831,12 +765,10 @@ async function settleHour() {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// Remove webhook on startup
 bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(()=>{});
 
 bot.catch((err, ctx) => log.error("Telegraf error:", err.message));
 
-// Rate limiting middleware
 bot.use((ctx, next) => {
   const userId = ctx.from?.id?.toString();
   if (!userId) return next();
@@ -855,7 +787,6 @@ bot.use((ctx, next) => {
   return next();
 });
 
-// Language middleware (simplified)
 bot.use((ctx, next) => {
   const userId = ctx.from?.id?.toString();
   if (userId && !userLang.has(userId)) userLang.set(userId, 'en');
@@ -895,7 +826,7 @@ bot.start(async (ctx) => {
 bot.help((ctx) => {
   ctx.reply(
     "📋 *All Commands*\n\n" +
-    "/register <address>\n/balance\n/leaderboard\n/poll\n/jackpot\n/daily\n/ref\n/achievements\n/vote_coin\n/tournament\n/verify\n/cancel\n/lang\n/stats\n/debug",
+    "/register <address>\n/balance\n/leaderboard\n/poll\n/jackpot\n/daily\n/ref\n/achievements\n/vote_coin\n/tournament\n/verify\n/cancel\n/stats\n/debug",
     { parse_mode: "Markdown" }
   );
 });
@@ -909,7 +840,6 @@ bot.command("register", async (ctx) => {
   if (!isValidSolanaAddress(wallet)) return ctx.reply("❌ Invalid address");
   userWallets.set(userId, { address: wallet, username });
   ctx.reply(`✅ Wallet registered for ${username}`);
-  // show poll
   setTimeout(() => ctx.reply(buildPollMessage(), { parse_mode: "Markdown", reply_markup: getPollKeyboard() }), 500);
 });
 
@@ -984,10 +914,7 @@ bot.command("tournament", (ctx) => {
 });
 
 bot.command("verify", (ctx) => {
-  const args = ctx.message.text.split(' ');
-  if (args.length < 2) return ctx.reply("Usage: /verify <poll_number> (not yet implemented)");
-  // simplified: show current server seed hash
-  ctx.reply(`Current poll seed hash: ${currentPoll.seedHash || 'not set'}\nAfter poll ends, use /reveal to get server seed.`);
+  ctx.reply(`Current poll seed hash: ${currentPoll.seedHash || 'not set'}\nAfter poll ends, the server seed will be revealed.`);
 });
 
 bot.command("stats", (ctx) => {
@@ -1006,7 +933,7 @@ bot.command("stats", (ctx) => {
 bot.command("cancel", async (ctx) => {
   const userId = getUserIdentifier(ctx);
   for (const [memo, pay] of pendingPayments.entries()) {
-    if (pay.userId === userId && !pay.memoId) { // temp entries
+    if (pay.userId === userId && memo.startsWith('temp_')) {
       clearTimeout(pay.timeoutHandle);
       pendingPayments.delete(memo);
       return ctx.reply("✅ Pending bet cancelled.");
@@ -1039,7 +966,6 @@ bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
     return ctx.answerCbQuery("❌ Register wallet first with /register", { show_alert: true });
   }
   const choice = ctx.match[1];
-  // check existing temp
   for (const [, pay] of pendingPayments.entries()) {
     if (pay.userId === userId && pay.awaitingAmount) {
       return ctx.answerCbQuery("⚠️ You already have a pending stake. Use /cancel", { show_alert: true });
@@ -1059,7 +985,7 @@ bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
   });
 });
 
-// ==================== TEXT HANDLER (amount) ====================
+// ==================== TEXT HANDLER ====================
 
 bot.on("text", async (ctx) => {
   const text = ctx.message.text.trim();
@@ -1109,23 +1035,15 @@ bot.on("text", async (ctx) => {
 // CRON JOBS
 // ============================================
 
-// Hourly settlement (at top of hour)
 cron.schedule("0 * * * *", settleHour, { timezone: "UTC" });
-
-// Update poll every 30 seconds
 cron.schedule("*/30 * * * * *", updatePoll);
-
-// Update leaderboard every 5 minutes
 cron.schedule("*/5 * * * *", updateLeaderboard);
 
-// Check tournament end every minute
 cron.schedule("* * * * *", () => {
   if (tournamentActive && Date.now() >= tournamentEndTime) endTournament();
 });
 
-// Cleanup old data daily
 cron.schedule("0 0 * * *", () => {
-  // clear old signatures
   if (processedTxSignatures.size > 1000) {
     const toDel = Array.from(processedTxSignatures).slice(0, 500);
     toDel.forEach(s => processedTxSignatures.delete(s));
@@ -1155,29 +1073,25 @@ app.listen(PORT, "0.0.0.0", () => log.ok(`Health check on port ${PORT}`));
 
 async function startup() {
   log.info("Starting up...");
-  // Wait for price
   for (let i = 0; i < 30; i++) {
     if (currentPrice > 0) break;
     await new Promise(r => setTimeout(r, 2000));
   }
-  if (currentPrice <= 0) currentPrice = 20; // fallback
+  if (currentPrice <= 0) currentPrice = 20;
   openPrice = currentPrice;
 
-  // Create initial poll
   currentPoll.seedHash = hashSeed(generateSeed());
   await updatePoll();
   await updateLeaderboard();
 
-  // Optionally start a tournament every weekend
   const now = new Date();
-  if (now.getDay() === 5 && now.getHours() === 20) { // Friday 8pm UTC
+  if (now.getDay() === 5 && now.getHours() === 20) {
     startTournament(48);
   }
 
   log.ok("Startup complete.");
 }
 
-// Launch bot
 bot.launch({ dropPendingUpdates: true })
   .then(() => {
     log.ok("🚀 Bot is live!");
@@ -1188,7 +1102,6 @@ bot.launch({ dropPendingUpdates: true })
     process.exit(1);
   });
 
-// Graceful shutdown
 ["SIGINT", "SIGTERM"].forEach(sig => {
   process.once(sig, () => {
     log.info(`Shutting down on ${sig}`);
