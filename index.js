@@ -4,7 +4,7 @@
  * DEGEN ECHO – PHANTOM WALLET INTEGRATION
  * One global poll per hour
  * 19% Rake | 80% Pot | 1% Jackpot
- * One-tap Phantom wallet approval
+ * One-tap Phantom wallet approval - FIXED VERSION
  */
 
 require("dotenv").config();
@@ -111,7 +111,7 @@ try {
 }
 
 // ============================================
-// PHANTOM WALLET CONNECTOR
+// PHANTOM WALLET CONNECTOR - FIXED VERSION
 // ============================================
 
 class PhantomConnector {
@@ -120,15 +120,15 @@ class PhantomConnector {
     this.dappKey = 'degen-echo-bot';
     this.sessionSecret = config.sessionSecret;
     this.sessions = new Map(); // sessionId -> session data
-    console.log("✅ Phantom connector initialized");
+    console.log("✅ Phantom connector initialized with URL:", this.appUrl);
   }
 
   generateConnectLink(userId) {
     const sessionId = this.createSession(userId);
-    const redirectUrl = `${this.appUrl}/phantom/callback`;
+    const redirectUrl = encodeURIComponent(`${this.appUrl}/phantom/callback`);
     
-    // Phantom universal link format
-    return `https://phantom.app/ul/v1/connect?app_url=${encodeURIComponent(redirectUrl)}&dapp_key=${this.dappKey}&session=${sessionId}`;
+    // FIXED: Added all required parameters for Phantom deep linking
+    return `https://phantom.app/ul/v1/connect?app_url=${redirectUrl}&dapp_key=${this.dappKey}&session=${sessionId}&redirect_url=${redirectUrl}&cluster=mainnet-beta`;
   }
 
   async generateTransactionLink(userId, amount, choice, walletAddress) {
@@ -160,10 +160,10 @@ class PhantomConnector {
       verifySignatures: false
     }));
 
-    const redirectUrl = `${this.appUrl}/phantom/callback`;
+    const redirectUrl = encodeURIComponent(`${this.appUrl}/phantom/callback`);
     
-    // Phantom sign and send transaction link
-    return `https://phantom.app/ul/v1/signAndSendTransaction?transaction=${serializedTx}&session=${session.id}&app_url=${encodeURIComponent(redirectUrl)}&dapp_key=${this.dappKey}`;
+    // FIXED: Added cluster parameter
+    return `https://phantom.app/ul/v1/signAndSendTransaction?transaction=${serializedTx}&session=${session.id}&app_url=${redirectUrl}&dapp_key=${this.dappKey}&redirect_url=${redirectUrl}&cluster=mainnet-beta`;
   }
 
   createSession(userId) {
@@ -190,7 +190,7 @@ class PhantomConnector {
     session.walletAddress = walletAddress;
     session.connectedAt = Date.now();
     session.expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
-    this.sessions.set(userId, session); // Store by userId for easy lookup
+    this.sessions.set(userId, session);
     this.sessions.set(sessionId, session);
     return session;
   }
