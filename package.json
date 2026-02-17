@@ -1,20 +1,21 @@
 {
   "name": "degen-echo-bot",
-  "version": "1.0.0",
-  "main": "degen-echo-fixed.js",
+  "version": "2.0.0",
+  "description": "Ultimate Telegram betting bot with Solana, Phantom, and full features",
+  "main": "index.js",
   "scripts": {
-    "start": "node degen-echo-fixed.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "telegraf": "^4.16.3",
-    "@solana/web3.js": "^1.91.1",
-    "ws": "^8.17.0",
-    "express": "^4.19.2",
-    "node-cron": "^3.0.3",
+    "@solana/web3.js": "^1.87.6",
     "bs58": "^5.0.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "node-cron": "^3.0.3",
+    "telegraf": "^4.15.3",
+    "ws": "^8.14.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "18.x"
   }
 }
