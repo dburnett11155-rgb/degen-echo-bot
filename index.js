@@ -13,6 +13,7 @@
  *  8. watchManualPayment — fixed recursive setTimeout leak on re-entry
  *  9. Daily reward payout failure — notifies user if wallet missing
  * 10. General: all unhandled promise rejections caught at process level
+ * 11. Added /envtest command to diagnose channel/group access
  */
 
 require("dotenv").config();
@@ -815,7 +816,7 @@ function buildLeaderboardMessage() {
 
 async function updatePoll() {
   try {
-    const text         = buildPollMessage();
+    const text = buildPollMessage();
     const reply_markup = getPollKeyboard();
 
     if (pollMessageId && pollChatId) {
@@ -828,7 +829,7 @@ async function updatePoll() {
       } catch (err) {
         log.warn("Poll edit failed, sending new message:", err.message);
         pollMessageId = null;
-        pollChatId    = null;
+        pollChatId = null;
       }
     }
 
@@ -837,18 +838,18 @@ async function updatePoll() {
         parse_mode: "Markdown", reply_markup,
       });
       pollMessageId = sent.message_id;
-      pollChatId    = sent.chat.id;
+      pollChatId = sent.chat.id;
       await bot.telegram.pinChatMessage(LIVE_CHANNEL, sent.message_id).catch(() => {});
     } catch (channelErr) {
-      log.error("Live channel failed, falling back to community group:", channelErr.message);
+      log.error(`Live channel failed, falling back to community group: ${channelErr.message}`);
       const sent = await bot.telegram.sendMessage(COMMUNITY_GROUP, text, {
         parse_mode: "Markdown", reply_markup,
       });
       pollMessageId = sent.message_id;
-      pollChatId    = sent.chat.id;
+      pollChatId = sent.chat.id;
     }
 
-    saveState(); // FIX 1: persist updated message IDs
+    saveState();
   } catch (err) {
     log.error("updatePoll error:", err.message);
   }
@@ -867,13 +868,13 @@ async function updateLeaderboard() {
         return;
       } catch (_) {
         leaderboardMessageId = null;
-        leaderboardChatId    = null;
+        leaderboardChatId = null;
       }
     }
 
     const sent = await bot.telegram.sendMessage(COMMUNITY_GROUP, text, { parse_mode: "Markdown" });
     leaderboardMessageId = sent.message_id;
-    leaderboardChatId    = sent.chat.id;
+    leaderboardChatId = sent.chat.id;
     await bot.telegram.pinChatMessage(COMMUNITY_GROUP, sent.message_id).catch(() => {});
     saveState();
   } catch (err) {
@@ -886,7 +887,6 @@ async function updateLeaderboard() {
 // ============================================
 
 async function settleHour() {
-  // FIX 5: prevent double-settlement if cron fires twice or startup races
   if (settlementInProgress) {
     log.warn("Settlement already in progress — skipping");
     return;
@@ -979,7 +979,7 @@ async function settleHour() {
 
     await updatePoll();
     await updateLeaderboard();
-    saveState(); // FIX 1: persist after settlement
+    saveState();
 
     if (tournamentActive && Date.now() >= tournamentEndTime) await endTournament();
   } finally {
@@ -1134,7 +1134,6 @@ bot.command("daily", async (ctx) => {
 
   saveState();
 
-  // FIX 9: tell the user if they have no wallet registered
   const wallet = getUserWallet(userId);
   if (!wallet) {
     return ctx.reply(
@@ -1256,6 +1255,46 @@ bot.command("debug", async (ctx) => {
   );
 });
 
+// 🔧 DIAGNOSTIC COMMAND – added for channel troubleshooting
+bot.command('envtest', async (ctx) => {
+  // Only allow admins
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) return;
+
+  const live = process.env.LIVE_CHANNEL || LIVE_CHANNEL;
+  const community = process.env.COMMUNITY_GROUP || COMMUNITY_GROUP;
+  const announce = process.env.ANNOUNCEMENTS_CHANNEL || ANNOUNCEMENTS_CHANNEL;
+
+  await ctx.reply(
+    `🔧 *Environment Variables*\n` +
+    `LIVE_CHANNEL: \`${live}\`\n` +
+    `COMMUNITY_GROUP: \`${community}\`\n` +
+    `ANNOUNCEMENTS_CHANNEL: \`${announce}\``,
+    { parse_mode: 'Markdown' }
+  );
+
+  // Test sending to each channel/group
+  try {
+    await bot.telegram.sendMessage(live, '🧪 Test from bot');
+    await ctx.reply('✅ LIVE_CHANNEL works');
+  } catch (e) {
+    await ctx.reply(`❌ LIVE_CHANNEL: ${e.message}`);
+  }
+
+  try {
+    await bot.telegram.sendMessage(community, '🧪 Test from bot');
+    await ctx.reply('✅ COMMUNITY_GROUP works');
+  } catch (e) {
+    await ctx.reply(`❌ COMMUNITY_GROUP: ${e.message}`);
+  }
+
+  try {
+    await bot.telegram.sendMessage(announce, '🧪 Test from bot');
+    await ctx.reply('✅ ANNOUNCEMENTS_CHANNEL works');
+  } catch (e) {
+    await ctx.reply(`❌ ANNOUNCEMENTS_CHANNEL: ${e.message}`);
+  }
+});
+
 bot.command("starttournament", async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id.toString())) return;
   const hours = parseInt(ctx.message.text.split(" ")[1]) || 24;
@@ -1280,7 +1319,6 @@ bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
   const choice   = ctx.match[1];
   const wallet   = getUserWallet(userId);
 
-  // FIX 6: cooldown to prevent rapid button spam
   const lastVote = voteActionCooldown.get(userId) || 0;
   if (Date.now() - lastVote < VOTE_COOLDOWN_MS) {
     return ctx.answerCbQuery("⏳ Please wait a moment before voting again.").catch(() => {});
@@ -1406,12 +1444,11 @@ bot.on("text", async (ctx) => {
     amount,
     choice  : pending.choice,
     chatId  : ctx.chat.id,
-    createdAt,       // FIX 2: store creation time
+    createdAt,
     expiresAt,
     timeoutHandle,
   });
 
-  // FIX 8: start watcher as async loop (no recursive setTimeout)
   watchManualPayment(memoId).catch((err) => log.error("watchManualPayment error:", err.message));
 
   const keyboard = txUrl
@@ -1495,7 +1532,6 @@ app.get("/phantom/callback", async (req, res) => {
     return htmlClose("❌ Connection failed. Please try again.");
   }
 
-  // FIX 7: validate public_key is a real Solana address before saving
   if (public_key && sessionId) {
     if (!isValidSolanaAddress(public_key)) {
       log.warn("Phantom callback: invalid public_key received:", public_key);
@@ -1515,7 +1551,7 @@ app.get("/phantom/callback", async (req, res) => {
         via         : "phantom",
       });
 
-      saveState(); // FIX 1: persist new wallet connection
+      saveState();
       log.ok(`Phantom wallet connected: ${public_key.slice(0, 8)}… for user ${session.userId}`);
 
       await bot.telegram.sendMessage(
@@ -1528,12 +1564,11 @@ app.get("/phantom/callback", async (req, res) => {
     }
   }
 
-  // Transaction confirmation
   if (transaction_signature && sessionId) {
     const betData = pendingPhantomBets.get(sessionId);
     if (betData) {
       pendingPhantomBets.delete(sessionId);
-      addProcessedSig(transaction_signature); // FIX 3
+      addProcessedSig(transaction_signature);
 
       await confirmBet(
         betData.userId,
@@ -1564,20 +1599,17 @@ cron.schedule("* * * * *", () => {
   if (tournamentActive && Date.now() >= tournamentEndTime) endTournament();
 });
 
-// FIX 3: daily cleanup now only handles rate limit map (sig cleanup is inline)
 cron.schedule("0 0 * * *", () => {
   const now = Date.now();
   for (const [uid, e] of rateLimitMap.entries()) {
     if (now - e.windowStart > RATE_WINDOW_MS * 2) rateLimitMap.delete(uid);
   }
-  // Also clear stale vote cooldowns
   for (const [uid, ts] of voteActionCooldown.entries()) {
     if (now - ts > 3_600_000) voteActionCooldown.delete(uid);
   }
   log.info("Daily cleanup done");
 });
 
-// FIX 1: periodic auto-save every 5 minutes as safety net
 cron.schedule("*/5 * * * *", saveState);
 
 // ============================================
@@ -1587,7 +1619,6 @@ cron.schedule("*/5 * * * *", saveState);
 async function startup() {
   log.info("Starting Degen Echo Bot…");
 
-  // FIX 1: load persisted state before anything else
   loadState();
 
   connectPriceWebSocket();
@@ -1598,7 +1629,6 @@ async function startup() {
   }
   if (currentPrice <= 0) { currentPrice = 20; log.warn("Using fallback price $20"); }
 
-  // Only reset openPrice if we don't have a persisted one
   if (!openPrice) openPrice = currentPrice;
 
   await updatePoll();
@@ -1606,22 +1636,13 @@ async function startup() {
   log.ok("✅ Startup complete!");
 }
 
-// ============================================
-// FIX 10: global unhandled rejection handler
-// ============================================
-
 process.on("unhandledRejection", (reason, promise) => {
   log.error("Unhandled promise rejection:", reason);
 });
 
 process.on("uncaughtException", (err) => {
   log.error("Uncaught exception:", err.message, err.stack);
-  // Don't exit — log and continue for non-fatal errors
 });
-
-// ============================================
-// LAUNCH
-// ============================================
 
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
@@ -1640,7 +1661,7 @@ bot.launch({ dropPendingUpdates: true })
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.once(sig, () => {
     log.info("Shutting down…");
-    saveState(); // FIX 1: save on graceful shutdown
+    saveState();
     bot.stop(sig);
     if (ws) ws.close();
     setTimeout(() => process.exit(0), 2000);
