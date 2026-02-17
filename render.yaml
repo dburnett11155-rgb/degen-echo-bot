@@ -13,5 +13,25 @@ services:
         value: 18.17.0
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 3000
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_PRIVATE_KEY
+        sync: false
+      - key: RAKE_WALLET
+        sync: false
+      - key: ADMIN_TELEGRAM_ID
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: LIVE_CHANNEL
+        value: @degenecholive
+      - key: ANNOUNCEMENTS_CHANNEL
+        value: @degenechochamber
+      - key: COMMUNITY_GROUP
+        value: @degenechochat
+      - key: SOLANA_RPC
+        value: https://api.mainnet-beta.solana.com
+      - key: DEBUG
+        value: false
