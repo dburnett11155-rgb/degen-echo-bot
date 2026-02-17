@@ -1,8 +1,8 @@
 "use strict";
 
 /**
- * Degen Echo Bot - Trustless Version
- * Bets are only registered after on-chain SOL confirmation
+ * Degen Echo Bot - Fully Automated
+ * Everything runs automatically - polls, payouts, leaderboard, pot updates
  */
 
 require("dotenv").config();
@@ -42,7 +42,6 @@ for (const key of REQUIRED_ENV) {
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BOT_PRIVATE_KEY = process.env.BOT_PRIVATE_KEY;
 const RAKE_WALLET = process.env.RAKE_WALLET;
-const JACKPOT_USDC_WALLET = process.env.JACKPOT_USDC_WALLET || RAKE_WALLET;
 const ADMIN_IDS = [process.env.ADMIN_TELEGRAM_ID, "1087968824"].filter(Boolean);
 
 const RAKE_PERCENT = 0.19;
@@ -50,8 +49,8 @@ const HOURLY_POT_PERCENT = 0.80;
 const JACKPOT_PERCENT = 0.01;
 
 const MIN_STAKE = 0.001;
-const PAYMENT_TIMEOUT_MS = 5 * 60 * 1000;   // 5 minutes to send SOL
-const POLL_INTERVAL_MS = 5000;               // check blockchain every 5 seconds
+const PAYMENT_TIMEOUT_MS = 5 * 60 * 1000;
+const POLL_INTERVAL_MS = 5000;
 const PORT = Number(process.env.PORT) || 3000;
 
 const LIVE_CHANNEL = process.env.LIVE_CHANNEL || "@degenecholive";
@@ -94,21 +93,22 @@ try {
 
 const prices = new Map(COINS.map((c) => [c, 0]));
 const activePolls = new Map();
-
-/**
- * pendingPayments: memoId → {
- *   userId, username, chatId, pollId, poll,
- *   choice, minAmount, expiresAt, timeoutHandle,
- *   notifiedAt (message id for status updates)
- * }
- */
 const pendingPayments = new Map();
-
 const userWallets = new Map();
 const hourlyBets = new Map();
 const processedTxSignatures = new Set();
+
+// Leaderboard: userId → { username, totalBets, totalWon, totalStaked, winStreak, bestStreak }
+const leaderboard = new Map();
+
 let jackpotAmountUSDC = 0;
 let pollCounter = 0;
+let totalVolumeSOL = 0;
+let totalPayoutsSOL = 0;
+
+// Pinned message IDs for live updates
+let pinnedLeaderboardMsgId = null;
+let pinnedPotMsgId = null;
 
 // ============================================
 // LOGGER
@@ -231,67 +231,201 @@ function formatPrice(pair) {
   return p < 0.0001 ? p.toExponential(4) : p.toFixed(p < 1 ? 8 : 4);
 }
 
-/** Generate a unique 8-character memo ID */
 function generateMemoId() {
   return Math.random().toString(36).substring(2, 10).toUpperCase();
+}
+
+// ============================================
+// LEADERBOARD HELPERS
+// ============================================
+
+function updateLeaderboard(userId, username, staked, won) {
+  const entry = leaderboard.get(userId) || {
+    username,
+    totalBets: 0,
+    totalWon: 0,
+    totalStaked: 0,
+    winStreak: 0,
+    bestStreak: 0,
+  };
+
+  entry.username = username;
+  entry.totalBets++;
+  entry.totalStaked += staked;
+
+  if (won > 0) {
+    entry.totalWon += won;
+    entry.winStreak++;
+    if (entry.winStreak > entry.bestStreak) entry.bestStreak = entry.winStreak;
+  } else {
+    entry.winStreak = 0;
+  }
+
+  leaderboard.set(userId, entry);
+}
+
+function buildLeaderboardMessage() {
+  if (leaderboard.size === 0) {
+    return `🏆 *Degen Echo Leaderboard*\n\n_No bets yet – be the first!_`;
+  }
+
+  const sorted = [...leaderboard.entries()]
+    .sort((a, b) => b[1].totalWon - a[1].totalWon)
+    .slice(0, 10);
+
+  const medals = ["🥇", "🥈", "🥉"];
+  let msg = `🏆 *Degen Echo Leaderboard*\n\n`;
+
+  sorted.forEach(([, entry], i) => {
+    const medal = medals[i] || `${i + 1}.`;
+    const winRate = entry.totalBets > 0
+      ? ((entry.totalWon / entry.totalStaked) * 100).toFixed(1)
+      : "0.0";
+    msg += `${medal} *${entry.username}*\n`;
+    msg += `   💰 Won: ${entry.totalWon.toFixed(4)} SOL\n`;
+    msg += `   🎯 Bets: ${entry.totalBets} | Win rate: ${winRate}%\n`;
+    if (entry.winStreak > 1) msg += `   🔥 Streak: ${entry.winStreak}\n`;
+    msg += `\n`;
+  });
+
+  msg += `📊 *All Time Stats*\n`;
+  msg += `💹 Total Volume: ${totalVolumeSOL.toFixed(4)} SOL\n`;
+  msg += `💸 Total Paid Out: ${totalPayoutsSOL.toFixed(4)} SOL\n`;
+  msg += `🎰 Jackpot: $${jackpotAmountUSDC.toFixed(2)} USDC`;
+
+  return msg;
+}
+
+function buildPotMessage() {
+  let totalPot = 0;
+  const potLines = [];
+
+  for (const [, poll] of activePolls.entries()) {
+    if (poll.pot > 0) {
+      totalPot += poll.pot;
+      const pumpTotal = poll.stakes
+        .filter(s => s.choice === "pump")
+        .reduce((sum, s) => sum + s.amount, 0);
+      const dumpTotal = poll.stakes
+        .filter(s => s.choice === "dump")
+        .reduce((sum, s) => sum + s.amount, 0);
+      const flatTotal = poll.stakes
+        .filter(s => s.choice === "stagnate")
+        .reduce((sum, s) => sum + s.amount, 0);
+
+      potLines.push(
+        `$${poll.coin}: *${poll.pot.toFixed(4)} SOL*\n` +
+        `   🚀 ${pumpTotal.toFixed(4)} | 📉 ${dumpTotal.toFixed(4)} | 🟡 ${flatTotal.toFixed(4)}`
+      );
+    }
+  }
+
+  let msg = `💰 *Live Pot Update*\n\n`;
+
+  if (potLines.length === 0) {
+    msg += `_No active bets yet this hour_\n\n`;
+  } else {
+    msg += potLines.join("\n\n") + "\n\n";
+  }
+
+  msg += `📦 *Total Pot: ${totalPot.toFixed(4)} SOL*\n`;
+  msg += `🏆 Jackpot: $${jackpotAmountUSDC.toFixed(2)} USDC\n`;
+  msg += `⏰ Pays out at the top of the hour`;
+
+  return msg;
+}
+
+// ============================================
+// AUTO UPDATE LEADERBOARD & POT
+// ============================================
+
+async function updateLiveLeaderboard() {
+  try {
+    const msg = buildLeaderboardMessage();
+
+    if (pinnedLeaderboardMsgId) {
+      await bot.telegram.editMessageText(
+        COMMUNITY_GROUP,
+        pinnedLeaderboardMsgId,
+        undefined,
+        msg,
+        { parse_mode: "Markdown" }
+      ).catch(async () => {
+        // Message too old to edit, post a new one
+        const sent = await bot.telegram.sendMessage(COMMUNITY_GROUP, msg, { parse_mode: "Markdown" });
+        pinnedLeaderboardMsgId = sent.message_id;
+        await bot.telegram.pinChatMessage(COMMUNITY_GROUP, sent.message_id).catch(() => {});
+      });
+    } else {
+      const sent = await bot.telegram.sendMessage(COMMUNITY_GROUP, msg, { parse_mode: "Markdown" });
+      pinnedLeaderboardMsgId = sent.message_id;
+      await bot.telegram.pinChatMessage(COMMUNITY_GROUP, sent.message_id).catch(() => {});
+    }
+  } catch (err) {
+    log.warn("updateLiveLeaderboard error:", err.message);
+  }
+}
+
+async function updateLivePot() {
+  try {
+    const msg = buildPotMessage();
+
+    if (pinnedPotMsgId) {
+      await bot.telegram.editMessageText(
+        LIVE_CHANNEL,
+        pinnedPotMsgId,
+        undefined,
+        msg,
+        { parse_mode: "Markdown" }
+      ).catch(async () => {
+        const sent = await bot.telegram.sendMessage(LIVE_CHANNEL, msg, { parse_mode: "Markdown" });
+        pinnedPotMsgId = sent.message_id;
+        await bot.telegram.pinChatMessage(LIVE_CHANNEL, sent.message_id).catch(() => {});
+      });
+    } else {
+      const sent = await bot.telegram.sendMessage(LIVE_CHANNEL, msg, { parse_mode: "Markdown" });
+      pinnedPotMsgId = sent.message_id;
+      await bot.telegram.pinChatMessage(LIVE_CHANNEL, sent.message_id).catch(() => {});
+    }
+  } catch (err) {
+    log.warn("updateLivePot error:", err.message);
+  }
 }
 
 // ============================================
 // BLOCKCHAIN PAYMENT WATCHER
 // ============================================
 
-/**
- * Scans recent transactions to the bot wallet and looks for
- * a transaction whose memo matches a pending payment.
- * Returns { signature, amount } if found, null otherwise.
- */
-async function checkForPayment(memoId, expectedAmount) {
+async function checkForPayment(memoId) {
   try {
     const botPubkey = botWallet.publicKey;
-
-    // Get recent signatures for the bot wallet
-    const signatures = await connection.getSignaturesForAddress(botPubkey, {
-      limit: 20,
-    });
+    const signatures = await connection.getSignaturesForAddress(botPubkey, { limit: 20 });
 
     for (const sigInfo of signatures) {
-      // Skip already processed transactions
       if (processedTxSignatures.has(sigInfo.signature)) continue;
       if (sigInfo.err) continue;
 
-      // Fetch full transaction
       const tx = await connection.getParsedTransaction(sigInfo.signature, {
         maxSupportedTransactionVersion: 0,
       });
 
       if (!tx) continue;
 
-      // Check for memo matching our memoId in the transaction's log messages
       const logMessages = tx.meta?.logMessages || [];
       const hasMemo = logMessages.some((msg) => msg.includes(memoId));
-
       if (!hasMemo) continue;
 
-      // Find how much SOL was transferred to the bot wallet
       const accountKeys = tx.transaction.message.accountKeys;
       const botIndex = accountKeys.findIndex(
         (k) => k.pubkey.toString() === botPubkey.toString()
       );
-
       if (botIndex === -1) continue;
 
-      const preBal = tx.meta.preBalances[botIndex];
-      const postBal = tx.meta.postBalances[botIndex];
-      const receivedLamports = postBal - preBal;
-
+      const receivedLamports = tx.meta.postBalances[botIndex] - tx.meta.preBalances[botIndex];
       if (receivedLamports <= 0) continue;
 
-      const receivedSOL = receivedLamports / LAMPORTS_PER_SOL;
-
-      // Mark as processed
       processedTxSignatures.add(sigInfo.signature);
-
-      return { signature: sigInfo.signature, amount: receivedSOL };
+      return { signature: sigInfo.signature, amount: receivedLamports / LAMPORTS_PER_SOL };
     }
 
     return null;
@@ -301,37 +435,21 @@ async function checkForPayment(memoId, expectedAmount) {
   }
 }
 
-/**
- * Start polling the blockchain for a specific payment.
- * When found, registers the bet automatically.
- * Times out after PAYMENT_TIMEOUT_MS.
- */
 async function watchForPayment(memoId) {
   const payment = pendingPayments.get(memoId);
   if (!payment) return;
-
-  // Check if expired
   if (Date.now() > payment.expiresAt) {
     await handlePaymentTimeout(memoId);
     return;
   }
-
-  // Check blockchain
-  const result = await checkForPayment(memoId, payment.minAmount);
-
+  const result = await checkForPayment(memoId);
   if (result) {
     await handlePaymentReceived(memoId, result.signature, result.amount);
     return;
   }
-
-  // Not found yet — check again after POLL_INTERVAL_MS
   setTimeout(() => watchForPayment(memoId), POLL_INTERVAL_MS);
 }
 
-/**
- * Called when on-chain payment is confirmed.
- * Registers the bet and updates the poll.
- */
 async function handlePaymentReceived(memoId, signature, receivedAmount) {
   const payment = pendingPayments.get(memoId);
   if (!payment) return;
@@ -340,15 +458,12 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
   pendingPayments.delete(memoId);
 
   const { userId, username, chatId, poll, choice } = payment;
-
-  // Scale bet to whatever they actually sent (handles wrong amounts gracefully)
   const amount = Math.round(receivedAmount * 1e6) / 1e6;
   const potContribution = parseFloat((amount * HOURLY_POT_PERCENT).toFixed(6));
   const jackpotSOL = parseFloat((amount * JACKPOT_PERCENT).toFixed(6));
   const solPrice = await getSolUsdPrice();
   const jackpotUsdcValue = parseFloat((jackpotSOL * solPrice).toFixed(4));
 
-  // Register bet
   poll.pot += potContribution;
   poll.stakes.push({
     userIdentifier: userId,
@@ -361,7 +476,6 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
     hour: Math.floor(Date.now() / 3600000),
   });
 
-  // Track for hourly payout
   const currentHour = Math.floor(Date.now() / 3600000);
   if (!hourlyBets.has(currentHour)) hourlyBets.set(currentHour, []);
   hourlyBets.get(currentHour).push({
@@ -375,11 +489,17 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
   });
 
   jackpotAmountUSDC += jackpotUsdcValue;
+  totalVolumeSOL += amount;
 
-  // Update poll message
+  // Update leaderboard entry (won = 0 until payout)
+  updateLeaderboard(userId, username, amount, 0);
+
   await refreshPollMessage(poll);
 
-  // Notify user
+  // Update live displays
+  await updateLivePot();
+  await updateLiveLeaderboard();
+
   const emojiMap = { pump: "🚀", dump: "📉", stagnate: "🟡" };
   await bot.telegram.sendMessage(
     chatId,
@@ -387,41 +507,30 @@ async function handlePaymentReceived(memoId, signature, receivedAmount) {
     `✅ Bet registered automatically\n` +
     `🎯 ${choice.toUpperCase()} on $${poll.coin}\n` +
     `💰 ${amount} SOL staked\n` +
-    `🏆 Jackpot: +$${jackpotUsdcValue.toFixed(2)} USDC\n` +
-    `Total Jackpot: $${jackpotAmountUSDC.toFixed(2)} USDC\n\n` +
+    `🏆 Jackpot: +$${jackpotUsdcValue.toFixed(2)} USDC\n\n` +
     `Good luck! 🍀\n` +
     `_TX: ${signature.slice(0, 8)}…${signature.slice(-8)}_`,
     { parse_mode: "Markdown" }
   ).catch(() => {});
 
-  // Announce in live channel
   bot.telegram.sendMessage(
     LIVE_CHANNEL,
-    `🎯 *New Bet!*\n👤 ${username}\n💰 ${amount} SOL → *${choice.toUpperCase()}* $${poll.coin}`,
-    { parse_mode: "Markdown" }
-  ).catch((err) => log.warn("Live channel post failed:", err.message));
-
-  log.ok(`Payment confirmed: ${amount} SOL from ${username} | memo: ${memoId} | tx: ${signature}`);
-}
-
-/**
- * Called when payment window expires without receiving SOL.
- */
-async function handlePaymentTimeout(memoId) {
-  const payment = pendingPayments.get(memoId);
-  if (!payment) return;
-
-  pendingPayments.delete(memoId);
-
-  await bot.telegram.sendMessage(
-    payment.chatId,
-    `⏱️ *Payment window expired*\n\n` +
-    `No SOL was detected for memo \`${memoId}\`.\n` +
-    `Click a poll button again to start a new bet.`,
+    `🎯 *New Bet!*\n👤 ${username}\n💰 ${amount} SOL → *${choice.toUpperCase()}* $${poll.coin}\n💰 Pot now: ${poll.pot.toFixed(4)} SOL`,
     { parse_mode: "Markdown" }
   ).catch(() => {});
 
-  log.warn(`Payment timeout: memo ${memoId} for ${payment.username}`);
+  log.ok(`Payment confirmed: ${amount} SOL from ${username} | memo: ${memoId}`);
+}
+
+async function handlePaymentTimeout(memoId) {
+  const payment = pendingPayments.get(memoId);
+  if (!payment) return;
+  pendingPayments.delete(memoId);
+  await bot.telegram.sendMessage(
+    payment.chatId,
+    `⏱️ *Payment window expired*\n\nNo SOL detected for memo \`${memoId}\`.\nClick a poll button again to start a new bet.`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
 }
 
 // ============================================
@@ -429,25 +538,20 @@ async function handlePaymentTimeout(memoId) {
 // ============================================
 
 async function sendPayout(toAddress, amountSOL, description) {
-  if (!botWallet || !connection) {
-    log.error("Payout skipped – bot wallet not configured");
-    return null;
-  }
+  if (!botWallet || !connection) return null;
 
   try {
     const toPubkey = new PublicKey(toAddress);
     const fromPubkey = botWallet.publicKey;
-
     const balanceLamports = await connection.getBalance(fromPubkey);
     const neededLamports = Math.ceil(amountSOL * LAMPORTS_PER_SOL) + 5000;
 
     if (balanceLamports < neededLamports) {
       const have = (balanceLamports / LAMPORTS_PER_SOL).toFixed(6);
-      log.warn(`Payout failed – insufficient balance. Have ${have} SOL, need ${amountSOL}`);
       for (const adminId of ADMIN_IDS) {
         await bot.telegram.sendMessage(
           adminId,
-          `⚠️ *Bot wallet low balance!*\nNeeded: ${amountSOL.toFixed(6)} SOL\nAvailable: ${have} SOL\nFor: ${description}`,
+          `⚠️ *Bot wallet low!*\nNeeded: ${amountSOL.toFixed(6)} SOL\nAvailable: ${have} SOL`,
           { parse_mode: "Markdown" }
         ).catch(() => {});
       }
@@ -455,7 +559,6 @@ async function sendPayout(toAddress, amountSOL, description) {
     }
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
-
     const tx = new Transaction().add(
       SystemProgram.transfer({
         fromPubkey,
@@ -472,12 +575,8 @@ async function sendPayout(toAddress, amountSOL, description) {
       preflightCommitment: "confirmed",
     });
 
-    await connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight },
-      "confirmed"
-    );
-
-    log.ok(`Payout sent: ${amountSOL} SOL → ${toAddress} | tx: ${signature}`);
+    await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+    log.ok(`Payout: ${amountSOL} SOL → ${toAddress} | ${description}`);
     return signature;
   } catch (err) {
     log.error("sendPayout failed:", err.message);
@@ -498,9 +597,7 @@ function buildPollMessage(pollNum, coin, priceStr, pot, stakes = []) {
   if (stakes.length === 0) return header + "\n_No stakes yet – be first!_";
 
   const grouped = { pump: [], dump: [], stagnate: [] };
-  for (const s of stakes) {
-    (grouped[s.choice] || []).push(s);
-  }
+  for (const s of stakes) (grouped[s.choice] || []).push(s);
 
   let body = "\n📊 *Current Stakes:*\n";
   const labels = { pump: "🚀 PUMP", dump: "📉 DUMP", stagnate: "🟡 FLAT" };
@@ -524,8 +621,7 @@ function getPollKeyboard(pollNum) {
 }
 
 async function refreshPollMessage(poll) {
-  const coinPair = `${poll.coin}/USD`;
-  const priceStr = formatPrice(coinPair);
+  const priceStr = formatPrice(`${poll.coin}/USD`);
   const text = buildPollMessage(poll.pollNum, poll.coin, priceStr, poll.pot, poll.stakes);
   try {
     await bot.telegram.editMessageText(
@@ -538,6 +634,48 @@ async function refreshPollMessage(poll) {
 }
 
 // ============================================
+// CREATE POLLS
+// ============================================
+
+async function createPolls(chatId) {
+  const results = [];
+  for (let i = 0; i < COINS.length; i++) {
+    const pair = COINS[i];
+    const coin = pair.replace("/USD", "");
+    pollCounter++;
+    const priceStr = formatPrice(pair);
+    const text = buildPollMessage(pollCounter, coin, priceStr, 0);
+
+    try {
+      const sent = await bot.telegram.sendMessage(chatId, text, {
+        parse_mode: "Markdown",
+        reply_markup: getPollKeyboard(pollCounter),
+      });
+
+      if (sent) {
+        const pollData = {
+          coin,
+          pollNum: pollCounter,
+          pot: 0,
+          stakes: [],
+          chatId: sent.chat.id,
+          messageId: sent.message_id,
+          hour: Math.floor(Date.now() / 3600000),
+          openPrice: prices.get(pair) || 0,
+        };
+        activePolls.set(sent.message_id.toString(), pollData);
+        results.push(pollData);
+      }
+
+      if (i < COINS.length - 1) await new Promise((r) => setTimeout(r, 300));
+    } catch (err) {
+      log.error(`Failed to create poll for ${coin}:`, err.message);
+    }
+  }
+  return results;
+}
+
+// ============================================
 // BOT SETUP
 // ============================================
 
@@ -547,7 +685,6 @@ bot.catch((err, ctx) => {
   log.error("Telegraf error:", err.message, "| update:", ctx?.updateType);
 });
 
-// Rate limiting
 const rateLimitMap = new Map();
 const RATE_LIMIT = 20;
 const RATE_WINDOW_MS = 60 * 1000;
@@ -582,8 +719,9 @@ bot.start((ctx) => {
     `*Commands:*\n` +
     `/register <wallet> – Link your Solana wallet\n` +
     `/balance – Check your wallet balance\n` +
-    `/poll – Create prediction polls\n` +
+    `/leaderboard – View top players\n` +
     `/jackpot – Check jackpot size\n` +
+    `/stats – Your personal stats\n` +
     `/cancel – Cancel a pending bet\n` +
     `/help – Show all commands`,
     { parse_mode: "Markdown" }
@@ -595,8 +733,9 @@ bot.help((ctx) => {
     `📋 *Degen Echo Commands*\n\n` +
     `/register <address> – Register your Solana wallet\n` +
     `/balance – Check your on-chain balance\n` +
-    `/poll – Spin up prediction polls\n` +
+    `/leaderboard – View top players\n` +
     `/jackpot – View current USDC jackpot\n` +
+    `/stats – Your personal stats\n` +
     `/cancel – Cancel your pending bet\n` +
     `/debug – Bot status (admins only)\n\n` +
     `*How to play:*\n` +
@@ -620,11 +759,9 @@ bot.command("register", async (ctx) => {
   }
 
   const walletAddress = args[1].trim();
-
   if (!isValidSolanaAddress(walletAddress)) {
     return ctx.reply("❌ Invalid Solana address. Please check and try again.");
   }
-
   if (walletAddress === botWallet.publicKey.toString() || walletAddress === RAKE_WALLET) {
     return ctx.reply("❌ You cannot register a system wallet.");
   }
@@ -654,6 +791,35 @@ bot.command("balance", async (ctx) => {
   );
 });
 
+bot.command("leaderboard", async (ctx) => {
+  return ctx.reply(buildLeaderboardMessage(), { parse_mode: "Markdown" });
+});
+
+bot.command("stats", async (ctx) => {
+  const userId = getUserIdentifier(ctx);
+  const entry = leaderboard.get(userId);
+
+  if (!entry) {
+    return ctx.reply("❌ No stats yet. Place a bet first!");
+  }
+
+  const winRate = entry.totalBets > 0
+    ? ((entry.totalWon / entry.totalStaked) * 100).toFixed(1)
+    : "0.0";
+
+  return ctx.reply(
+    `📊 *Your Stats*\n\n` +
+    `👤 ${entry.username}\n` +
+    `🎯 Total Bets: ${entry.totalBets}\n` +
+    `💰 Total Staked: ${entry.totalStaked.toFixed(4)} SOL\n` +
+    `🏆 Total Won: ${entry.totalWon.toFixed(4)} SOL\n` +
+    `📈 Win Rate: ${winRate}%\n` +
+    `🔥 Current Streak: ${entry.winStreak}\n` +
+    `⭐ Best Streak: ${entry.bestStreak}`,
+    { parse_mode: "Markdown" }
+  );
+});
+
 bot.command("jackpot", async (ctx) => {
   const solPrice = await getSolUsdPrice();
   const botBalSOL = botWallet
@@ -670,26 +836,16 @@ bot.command("jackpot", async (ctx) => {
 
 bot.command("cancel", async (ctx) => {
   const userId = getUserIdentifier(ctx);
-
-  // Find any pending payment for this user
   let found = null;
   for (const [memoId, payment] of pendingPayments.entries()) {
-    if (payment.userId === userId) {
-      found = memoId;
-      break;
-    }
+    if (payment.userId === userId) { found = memoId; break; }
   }
-
   if (!found) return ctx.reply("❌ No pending bet to cancel.");
-
   const payment = pendingPayments.get(found);
   clearTimeout(payment.timeoutHandle);
   pendingPayments.delete(found);
-
   return ctx.reply(
-    `✅ Pending bet cancelled.\n\n` +
-    `⚠️ If you already sent SOL with memo \`${found}\`, it will still be detected and registered. ` +
-    `Contact an admin if you need a refund.`,
+    `✅ Pending bet cancelled.\n\n⚠️ If you already sent SOL with memo \`${found}\`, contact an admin for a refund.`,
     { parse_mode: "Markdown" }
   );
 });
@@ -701,51 +857,18 @@ bot.command("debug", async (ctx) => {
   const priceLines = COINS.map((c) => `${c}: $${formatPrice(c)}`).join("\n");
   return ctx.reply(
     `🔧 *Debug Info*\n\n` +
-    `Bot Wallet: \`${botWallet?.publicKey.toString() ?? "none"}\`\n` +
     `Bot Balance: ${botBal.toFixed(6)} SOL\n` +
     `Jackpot: $${jackpotAmountUSDC.toFixed(2)} USDC\n` +
+    `Total Volume: ${totalVolumeSOL.toFixed(4)} SOL\n` +
+    `Total Payouts: ${totalPayoutsSOL.toFixed(4)} SOL\n` +
     `Active Polls: ${activePolls.size}\n` +
     `Pending Payments: ${pendingPayments.size}\n` +
     `Registered Users: ${userWallets.size}\n` +
-    `Processed Txs: ${processedTxSignatures.size}\n` +
+    `Leaderboard Entries: ${leaderboard.size}\n` +
     `Uptime: ${Math.floor(process.uptime())}s\n\n` +
     `*Prices:*\n${priceLines}`,
     { parse_mode: "Markdown" }
   );
-});
-
-bot.command("poll", async (ctx) => {
-  const userId = getUserIdentifier(ctx);
-  if (!userWallets.has(userId) && !ADMIN_IDS.includes(ctx.from?.id?.toString())) {
-    return ctx.reply("❌ Register a wallet first. Use `/register <address>`.", { parse_mode: "Markdown" });
-  }
-
-  try {
-    await ctx.reply("🚀 Creating prediction polls…");
-    for (let i = 0; i < COINS.length; i++) {
-      const pair = COINS[i];
-      const coin = pair.replace("/USD", "");
-      pollCounter++;
-      const priceStr = formatPrice(pair);
-      const text = buildPollMessage(pollCounter, coin, priceStr, 0);
-      const sent = await ctx.reply(text, {
-        parse_mode: "Markdown",
-        reply_markup: getPollKeyboard(pollCounter),
-      });
-      if (sent) {
-        activePolls.set(sent.message_id.toString(), {
-          coin, pollNum: pollCounter, pot: 0, stakes: [],
-          chatId: ctx.chat.id, messageId: sent.message_id,
-          hour: Math.floor(Date.now() / 3600000),
-          openPrice: prices.get(pair) || 0,  // snapshot price at poll open
-        });
-      }
-      if (i < COINS.length - 1) await new Promise((r) => setTimeout(r, 300));
-    }
-  } catch (err) {
-    log.error("/poll error:", err.message);
-    return ctx.reply("❌ Failed to create polls. Please try again.");
-  }
 });
 
 // ============================================
@@ -770,47 +893,34 @@ bot.action(/^vote_(\d+)_(pump|dump|stagnate)$/, async (ctx) => {
     return ctx.answerCbQuery("❌ This poll has expired.", { show_alert: true }).catch(() => {});
   }
 
-  // Check if user already has a pending payment
   for (const [, payment] of pendingPayments.entries()) {
     if (payment.userId === userId) {
-      return ctx.answerCbQuery(
-        "⚠️ You have a pending payment. Use /cancel to cancel it.",
-        { show_alert: true }
-      ).catch(() => {});
+      return ctx.answerCbQuery("⚠️ You have a pending payment. Use /cancel to cancel it.", { show_alert: true }).catch(() => {});
     }
   }
 
   const emojiMap = { pump: "🚀", dump: "📉", stagnate: "🟡" };
-
   await ctx.reply(
-    `${emojiMap[choice]} You picked *${choice.toUpperCase()}* on $${poll.coin}!\n\n` +
-    `How much SOL do you want to stake? _(min ${MIN_STAKE} SOL)_`,
+    `${emojiMap[choice]} You picked *${choice.toUpperCase()}* on $${poll.coin}!\n\nHow much SOL? _(min ${MIN_STAKE} SOL)_`,
     { parse_mode: "Markdown" }
   );
 
-  // Store partial state waiting for amount
-  // We use a temporary key until they enter the amount
   const tempKey = `temp_${userId}`;
   pendingPayments.set(tempKey, {
     userId, username, chatId: ctx.chat.id,
-    pollId, poll, choice,
-    awaitingAmount: true,
+    pollId, poll, choice, awaitingAmount: true,
   });
 
-  // Auto-clear if they don't respond
   setTimeout(() => {
     if (pendingPayments.has(tempKey)) {
       pendingPayments.delete(tempKey);
-      bot.telegram.sendMessage(
-        ctx.chat.id,
-        `⏱️ Timed out waiting for your stake amount. Click a button again to retry.`
-      ).catch(() => {});
+      bot.telegram.sendMessage(ctx.chat.id, `⏱️ Timed out. Click a button again to retry.`).catch(() => {});
     }
   }, PAYMENT_TIMEOUT_MS);
 });
 
 // ============================================
-// TEXT HANDLER — stake amount entry
+// TEXT HANDLER
 // ============================================
 
 bot.on("text", async (ctx) => {
@@ -819,7 +929,6 @@ bot.on("text", async (ctx) => {
 
   const userId = getUserIdentifier(ctx);
   const tempKey = `temp_${userId}`;
-
   if (!pendingPayments.has(tempKey)) return;
 
   const partial = pendingPayments.get(tempKey);
@@ -831,15 +940,11 @@ bot.on("text", async (ctx) => {
   const amount = validation.amount;
   const rakeAmount = parseFloat((amount * RAKE_PERCENT).toFixed(6));
   const botAmount = parseFloat((amount * (HOURLY_POT_PERCENT + JACKPOT_PERCENT)).toFixed(6));
-
-  // Generate unique memo for this bet
   const memoId = generateMemoId();
   const expiresAt = Date.now() + PAYMENT_TIMEOUT_MS;
 
-  // Remove temp entry
   pendingPayments.delete(tempKey);
 
-  // Set up real payment watcher entry
   const timeoutHandle = setTimeout(() => handlePaymentTimeout(memoId), PAYMENT_TIMEOUT_MS);
 
   pendingPayments.set(memoId, {
@@ -854,7 +959,6 @@ bot.on("text", async (ctx) => {
     timeoutHandle,
   });
 
-  // Send payment instructions
   await ctx.reply(
     `📋 *Payment Instructions*\n\n` +
     `💰 Total: *${amount} SOL*\n` +
@@ -864,126 +968,142 @@ bot.on("text", async (ctx) => {
     `\`${RAKE_WALLET}\`\n\n` +
     `🤖 *Bot wallet (${((HOURLY_POT_PERCENT + JACKPOT_PERCENT) * 100).toFixed(0)}%):* ${botAmount} SOL\n` +
     `\`${botWallet.publicKey.toString()}\`\n\n` +
-    `🔑 *Your memo ID:* \`${memoId}\`\n` +
-    `_(You must include this memo or your bet won't be detected)_\n\n` +
+    `🔑 *Memo ID:* \`${memoId}\`\n` +
+    `_(Must include memo or bet won't be detected)_\n\n` +
     `⏱️ You have *5 minutes* to send.\n` +
-    `The bot will confirm automatically once SOL is on-chain.\n\n` +
-    `Use /cancel if you change your mind.`,
+    `Bot confirms automatically once on-chain. ✅`,
     { parse_mode: "Markdown" }
   );
 
-  // Start watching the blockchain
   setTimeout(() => watchForPayment(memoId), POLL_INTERVAL_MS);
-
-  log.info(`Payment watch started: memo ${memoId} | ${partial.username} | ${amount} SOL | ${partial.choice} on ${partial.poll.coin}`);
 });
 
 // ============================================
-// HOURLY PAYOUT CRON
+// HOURLY CRON — payouts + fresh polls
 // ============================================
 
 cron.schedule("0 * * * *", async () => {
   const lastHour = Math.floor(Date.now() / 3600000) - 1;
   const hourBets = hourlyBets.get(lastHour) || [];
 
-  log.info(`Hourly payout – hour ${lastHour}, ${hourBets.length} bets`);
+  log.info(`Hourly cron – hour ${lastHour}, ${hourBets.length} bets`);
 
-  if (hourBets.length < 2) {
-    log.info("Not enough bets for hourly payout, skipping.");
+  // ── PAYOUTS ──
+  if (hourBets.length >= 2) {
+    const byCoins = new Map();
+    for (const bet of hourBets) {
+      if (!byCoins.has(bet.coin)) byCoins.set(bet.coin, []);
+      byCoins.get(bet.coin).push(bet);
+    }
+
+    let totalPaidOut = 0;
+    let totalWinners = 0;
+    const resultLines = [];
+
+    for (const [coin, bets] of byCoins.entries()) {
+      const pair = `${coin}/USD`;
+      const currentPrice = prices.get(pair);
+      if (!currentPrice || currentPrice === 0) continue;
+
+      let openPrice = 0;
+      for (const [, poll] of activePolls.entries()) {
+        if (poll.coin === coin && poll.hour === lastHour) {
+          openPrice = poll.openPrice || 0;
+          break;
+        }
+      }
+      if (openPrice === 0) continue;
+
+      let winnerChoice;
+      if (currentPrice > openPrice * 1.001) winnerChoice = "pump";
+      else if (currentPrice < openPrice * 0.999) winnerChoice = "dump";
+      else winnerChoice = "stagnate";
+
+      const emojiMap = { pump: "🚀", dump: "📉", stagnate: "🟡" };
+      resultLines.push(`$${coin}: ${emojiMap[winnerChoice]} ${winnerChoice.toUpperCase()} (open: $${openPrice.toFixed(4)} → close: $${currentPrice.toFixed(4)})`);
+
+      const totalPot = bets.reduce((s, b) => s + b.amount, 0);
+      const choices = { pump: [], dump: [], stagnate: [] };
+      for (const b of bets) {
+        if (choices[b.choice]) choices[b.choice].push(b);
+      }
+
+      const winners = choices[winnerChoice];
+      if (!winners || winners.length === 0) continue;
+
+      const winnerPot = winners.reduce((s, w) => s + w.amount, 0);
+
+      for (const winner of winners) {
+        if (!winner.address) continue;
+        const share = winner.amount / winnerPot;
+        const payout = parseFloat((totalPot * share).toFixed(6));
+        const sig = await sendPayout(winner.address, payout, `Hourly – ${coin} ${winnerChoice}`);
+
+        if (sig) {
+          totalPaidOut += payout;
+          totalWinners++;
+          totalPayoutsSOL += payout;
+
+          // Update leaderboard with winnings
+          updateLeaderboard(winner.userId, winner.username, 0, payout);
+
+          await bot.telegram.sendMessage(
+            winner.userId,
+            `🏆 *You won!*\n\n` +
+            `$${coin} went *${winnerChoice.toUpperCase()}*\n` +
+            `💰 You received *${payout.toFixed(6)} SOL*\n` +
+            `_TX: ${sig.slice(0, 8)}…${sig.slice(-8)}_`,
+            { parse_mode: "Markdown" }
+          ).catch(() => {});
+        }
+      }
+    }
+
     hourlyBets.delete(lastHour);
-    return;
-  }
-
-  const byCoins = new Map();
-  for (const bet of hourBets) {
-    if (!byCoins.has(bet.coin)) byCoins.set(bet.coin, []);
-    byCoins.get(bet.coin).push(bet);
-  }
-
-  let totalPaidOut = 0;
-  let totalWinners = 0;
-
-  for (const [coin, bets] of byCoins.entries()) {
-    const pair = `${coin}/USD`;
-    const currentPrice = prices.get(pair);
-    if (!currentPrice || currentPrice === 0) {
-      log.warn(`No price for ${pair}, skipping payout`);
-      continue;
+    for (const [msgId, poll] of activePolls.entries()) {
+      if (poll.hour === lastHour) activePolls.delete(msgId);
     }
 
-    // Find the poll for this coin to get opening price
-    let openPrice = 0;
-    for (const [, poll] of activePolls.entries()) {
-      if (poll.coin === coin && poll.hour === lastHour) {
-        openPrice = poll.openPrice || 0;
-        break;
-      }
-    }
+    // Post results
+    await bot.telegram.sendMessage(
+      ANNOUNCEMENTS_CHANNEL,
+      `⏰ *Hourly Results*\n\n` +
+      resultLines.join("\n") + "\n\n" +
+      `🏆 Winners: ${totalWinners}\n` +
+      `💰 Paid out: ${totalPaidOut.toFixed(6)} SOL\n` +
+      `🎰 Jackpot: $${jackpotAmountUSDC.toFixed(2)} USDC`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
 
-    // Determine winner based on open vs close price
-    let winnerChoice;
-    if (openPrice === 0) {
-      log.warn(`No open price for ${coin}, skipping`);
-      continue;
-    } else if (currentPrice > openPrice * 1.001) {
-      winnerChoice = "pump";
-    } else if (currentPrice < openPrice * 0.999) {
-      winnerChoice = "dump";
-    } else {
-      winnerChoice = "stagnate";
-    }
-
-    log.info(`${coin}: open $${openPrice} → close $${currentPrice} → winner: ${winnerChoice}`);
-
-    const totalPot = bets.reduce((s, b) => s + b.amount, 0);
-    const choices = { pump: [], dump: [], stagnate: [] };
-    for (const b of bets) {
-      if (choices[b.choice]) choices[b.choice].push(b);
-    }
-
-    const winners = choices[winnerChoice];
-    if (!winners || winners.length === 0) {
-      log.info(`No winners for ${coin} – pot rolls over`);
-      continue;
-    }
-
-    const winnerPot = winners.reduce((s, w) => s + w.amount, 0);
-
-    for (const winner of winners) {
-      if (!winner.address) continue;
-      const share = winner.amount / winnerPot;
-      const payout = parseFloat((totalPot * share).toFixed(6));
-      const sig = await sendPayout(winner.address, payout, `Hourly – ${coin} ${winnerChoice}`);
-      if (sig) {
-        totalPaidOut += payout;
-        totalWinners++;
-        await bot.telegram.sendMessage(
-          winner.userId,
-          `🏆 *You won!*\n\n` +
-          `$${coin} went *${winnerChoice.toUpperCase()}*\n` +
-          `💰 You received *${payout.toFixed(6)} SOL*\n` +
-          `_TX: ${sig.slice(0, 8)}…${sig.slice(-8)}_`,
-          { parse_mode: "Markdown" }
-        ).catch(() => {});
-      }
+    log.ok(`Payouts done: ${totalWinners} winners, ${totalPaidOut.toFixed(6)} SOL`);
+  } else {
+    hourlyBets.delete(lastHour);
+    for (const [msgId, poll] of activePolls.entries()) {
+      if (poll.hour === lastHour) activePolls.delete(msgId);
     }
   }
 
-  hourlyBets.delete(lastHour);
-  for (const [msgId, poll] of activePolls.entries()) {
-    if (poll.hour === lastHour) activePolls.delete(msgId);
-  }
+  // ── CREATE NEW POLLS ──
+  await createPolls(LIVE_CHANNEL);
 
-  await bot.telegram.sendMessage(
-    ANNOUNCEMENTS_CHANNEL,
-    `⏰ *Hourly Payout Complete!*\n\n` +
-    `🏆 Winners paid: ${totalWinners}\n` +
-    `💰 Total distributed: ${totalPaidOut.toFixed(6)} SOL\n` +
-    `🎰 Jackpot: $${jackpotAmountUSDC.toFixed(2)} USDC`,
-    { parse_mode: "Markdown" }
-  ).catch((err) => log.warn("Announcement failed:", err.message));
+  // ── UPDATE LEADERBOARD ──
+  await updateLiveLeaderboard();
 
-  log.ok(`Hourly payout complete: ${totalWinners} winners, ${totalPaidOut.toFixed(6)} SOL`);
+  // Reset pot display for new hour
+  pinnedPotMsgId = null;
+  await updateLivePot();
+
+  log.ok("New polls created and displays updated");
+});
+
+// ── Update pot display every 5 minutes ──
+cron.schedule("*/5 * * * *", async () => {
+  await updateLivePot();
+});
+
+// ── Update leaderboard every 15 minutes ──
+cron.schedule("*/15 * * * *", async () => {
+  await updateLiveLeaderboard();
 });
 
 // ============================================
@@ -1016,6 +1136,9 @@ app.get("/health", (_req, res) => {
     activePolls: activePolls.size,
     pendingPayments: pendingPayments.size,
     jackpotUSDC: jackpotAmountUSDC,
+    totalVolumeSOL,
+    totalPayoutsSOL,
+    leaderboardSize: leaderboard.size,
     botWallet: botWallet?.publicKey.toString(),
     prices: Object.fromEntries(prices),
   });
@@ -1037,6 +1160,12 @@ bot.launch({ dropPendingUpdates: true })
     log.ok("Bot is LIVE!");
     log.ok("Rake wallet:", RAKE_WALLET);
     log.ok("Bot wallet:", botWallet.publicKey.toString());
+    // Wait 5 seconds for prices to load then create startup polls
+    setTimeout(async () => {
+      await createPolls(LIVE_CHANNEL);
+      await updateLiveLeaderboard();
+      await updateLivePot();
+    }, 5000);
   })
   .catch((err) => {
     log.error("Bot launch failed:", err.message);
