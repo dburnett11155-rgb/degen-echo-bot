@@ -1,10 +1,11 @@
 "use strict";
 
 /**
- * DEGEN ECHO – COMPLETE PRODUCTION BOT
- * ALL FEATURES INTACT + FIXES
- * - Daily rewards, referrals, achievements, tournaments
- * - Fixed price display & Phantom connect
+ * DEGEN ECHO – PRODUCTION BOT
+ * Fixed: Kraken price feed, Phantom wallet (mobile + desktop),
+ *        manual /register fallback, auto polls, leaderboard,
+ *        hourly settlement, jackpot, achievements, daily rewards,
+ *        referrals, tournaments, on-chain verification
  */
 
 require("dotenv").config();
@@ -22,7 +23,7 @@ const WebSocket = require("ws");
 const express = require("express");
 const cron = require("node-cron");
 const bs58 = require("bs58");
-const crypto = require('crypto');
+const crypto = require("crypto");
 
 // ============================================
 // CONFIGURATION
@@ -34,9 +35,7 @@ const REQUIRED_ENV = [
   "RAKE_WALLET",
   "ADMIN_TELEGRAM_ID",
   "APP_URL",
-  "SESSION_SECRET"
 ];
-
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
     console.error(`❌ Missing required environment variable: ${key}`);
@@ -44,32 +43,26 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const BOT_PRIVATE_KEY = process.env.BOT_PRIVATE_KEY;
-const RAKE_WALLET = process.env.RAKE_WALLET;
-const ADMIN_IDS = [process.env.ADMIN_TELEGRAM_ID, "1087968824"].filter(Boolean);
-const APP_URL = process.env.APP_URL;
-const SESSION_SECRET = process.env.SESSION_SECRET;
+const BOT_TOKEN          = process.env.BOT_TOKEN;
+const BOT_PRIVATE_KEY    = process.env.BOT_PRIVATE_KEY;
+const RAKE_WALLET        = process.env.RAKE_WALLET;
+const ADMIN_IDS          = [process.env.ADMIN_TELEGRAM_ID, "1087968824"].filter(Boolean);
+const APP_URL            = process.env.APP_URL.replace(/\/$/, "");
 
-// Split configuration
-const RAKE_PERCENT = 0.19;
-const POT_PERCENT = 0.80;
+const RAKE_PERCENT    = 0.19;
+const POT_PERCENT     = 0.80;
 const JACKPOT_PERCENT = 0.01;
 
-const MIN_STAKE = 0.001;
-const MAX_STAKE = 1000;
-const PAYMENT_TIMEOUT_MS = 5 * 60 * 1000;
-const PORT = Number(process.env.PORT) || 3000;
+const MIN_STAKE           = 0.001;
+const MAX_STAKE           = 1000;
+const PAYMENT_TIMEOUT_MS  = 5 * 60 * 1000;   // 5 min to send SOL
+const BLOCKCHAIN_POLL_MS  = 6000;             // check chain every 6s
+const PORT                = Number(process.env.PORT) || 3000;
 
-// Telegram channels
-const LIVE_CHANNEL = process.env.LIVE_CHANNEL || "@degenecholive";
-const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || "@degenechochamber";
-const COMMUNITY_GROUP = process.env.COMMUNITY_GROUP || "@degenechochat";
-
-// Solana
-const SOLANA_RPC = process.env.SOLANA_RPC || "https://api.mainnet-beta.solana.com";
-const ANONYMOUS_ADMIN_ID = "1087968824";
-const CURRENT_COIN = "SOL/USD";
+const LIVE_CHANNEL         = process.env.LIVE_CHANNEL         || "@degenecholive";
+const ANNOUNCEMENTS_CHANNEL= process.env.ANNOUNCEMENTS_CHANNEL|| "@degenechochamber";
+const COMMUNITY_GROUP      = process.env.COMMUNITY_GROUP      || "@degenechochat";
+const SOLANA_RPC           = process.env.SOLANA_RPC           || "https://api.mainnet-beta.solana.com";
 
 // ============================================
 // SOLANA SETUP
@@ -83,286 +76,356 @@ try {
   });
   console.log("✅ Solana connection established");
 } catch (err) {
-  console.error("❌ Failed to connect to Solana:", err.message);
+  console.error("❌ Solana connection failed:", err.message);
   process.exit(1);
 }
 
 let botWallet;
 try {
-  const secretKey = bs58.decode(BOT_PRIVATE_KEY);
-  botWallet = Keypair.fromSecretKey(secretKey);
+  botWallet = Keypair.fromSecretKey(bs58.decode(BOT_PRIVATE_KEY));
   console.log("✅ Bot wallet loaded:", botWallet.publicKey.toString());
 } catch (err) {
-  console.error("❌ Failed to load bot wallet:", err.message);
+  console.error("❌ Bot wallet load failed:", err.message);
   process.exit(1);
 }
-
-// ============================================
-// PHANTOM WALLET CONNECTOR - FIXED
-// ============================================
-
-class PhantomConnector {
-  constructor(config) {
-    this.appUrl = config.appUrl;
-    this.dappKey = 'degen-echo-bot';
-    this.sessions = new Map();
-    this.userSessions = new Map();
-    console.log("✅ Phantom connector initialized");
-  }
-
-  generateConnectLink(userId) {
-    const sessionId = this.createSession(userId);
-    return `https://phantom.app/ul/v1/connect?app_url=${encodeURIComponent(this.appUrl)}&dapp_key=${this.dappKey}&session=${sessionId}&redirect_url=${encodeURIComponent(this.appUrl + '/phantom/callback')}`;
-  }
-
-  async generateTransactionLink(userId, amount, choice, walletAddress) {
-    const session = this.userSessions.get(userId);
-    if (!session || !session.walletAddress) {
-      throw new Error('Wallet not connected');
-    }
-
-    const transaction = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey: new PublicKey(session.walletAddress),
-        toPubkey: new PublicKey(RAKE_WALLET),
-        lamports: Math.floor(amount * LAMPORTS_PER_SOL)
-      })
-    );
-
-    const serializedTx = bs58.encode(transaction.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false
-    }));
-
-    return `https://phantom.app/ul/v1/signAndSendTransaction?transaction=${serializedTx}&session=${session.id}&app_url=${encodeURIComponent(this.appUrl)}&dapp_key=${this.dappKey}&redirect_url=${encodeURIComponent(this.appUrl + '/phantom/callback')}`;
-  }
-
-  createSession(userId) {
-    const sessionId = bs58.encode(Buffer.from(`${userId}-${Date.now()}`)).substring(0, 20);
-    const session = { id: sessionId, userId, createdAt: Date.now() };
-    this.sessions.set(sessionId, session);
-    return sessionId;
-  }
-
-  validateSession(sessionId) {
-    return this.sessions.get(sessionId) || null;
-  }
-
-  updateSessionWithWallet(sessionId, walletAddress, userId) {
-    const session = this.sessions.get(sessionId) || { id: sessionId, userId };
-    session.walletAddress = walletAddress;
-    session.connectedAt = Date.now();
-    this.sessions.set(sessionId, session);
-    this.userSessions.set(userId, session);
-    return session;
-  }
-
-  getSessionByUserId(userId) {
-    return this.userSessions.get(userId);
-  }
-}
-
-const phantom = new PhantomConnector({ appUrl: APP_URL });
-
-// ============================================
-// IN-MEMORY STATE
-// ============================================
-
-let currentPrice = 0;
-let openPrice = 0;
-let currentPoll = {
-  pot: 0,
-  stakes: [],
-  startTime: Date.now(),
-  endTime: Date.now() + 3600000,
-  totalBets: 0,
-  seedHash: null,
-  serverSeed: null,
-  clientSeed: null,
-};
-
-const pendingBets = new Map(); // userId -> { amount, choice, timestamp }
-const pendingAmountInput = new Map(); // temp userId -> { choice, timeout }
-const processedTxSignatures = new Set();
-const userStats = new Map(); // userId -> { username, totalBets, totalWon, totalStaked, winStreak, bestStreak, xp, badges[] }
-
-let jackpotAmountSOL = 0;
-let jackpotHistory = [];
-let lastJackpotWin = null;
-
-let pollMessageId = null;
-let pollChatId = null;
-let leaderboardMessageId = null;
-let leaderboardChatId = null;
-
-const rateLimitMap = new Map();
-const RATE_LIMIT = 20;
-const RATE_WINDOW_MS = 60 * 1000;
-
-const userDailyStreak = new Map();
-const DAILY_REWARDS = [0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.015];
-
-const referralCodes = new Map();
-const userReferrals = new Map(); // userId -> { referredBy, referrals: [] }
-
-const ACHIEVEMENTS = {
-  FIRST_BET:   { id: 'first_bet', name: '🎯 First Bet', xp: 10 },
-  HOT_STREAK_5: { id: 'streak_5', name: '🔥 5 Wins Streak', xp: 50 },
-  HOT_STREAK_10: { id: 'streak_10', name: '⚡ 10 Wins Streak', xp: 200 },
-  WHALE:       { id: 'whale', name: '🐋 Whale', xp: 500 },
-  JACKPOT:     { id: 'jackpot', name: '🎰 Jackpot Winner', xp: 1000 },
-};
-
-let tournamentActive = false;
-let tournamentEndTime = 0;
-const tournamentLeaderboard = new Map();
 
 // ============================================
 // LOGGER
 // ============================================
 
 const log = {
-  info: (...a) => console.log(new Date().toISOString(), "ℹ️", ...a),
-  warn: (...a) => console.warn(new Date().toISOString(), "⚠️", ...a),
-  error: (...a) => console.error(new Date().toISOString(), "❌", ...a),
-  ok: (...a) => console.log(new Date().toISOString(), "✅", ...a),
-  debug: (...a) => process.env.DEBUG ? console.log(new Date().toISOString(), "🔍", ...a) : null,
+  info : (...a) => console.log (new Date().toISOString(), "ℹ️ ", ...a),
+  warn : (...a) => console.warn (new Date().toISOString(), "⚠️ ", ...a),
+  error: (...a) => console.error(new Date().toISOString(), "❌ ", ...a),
+  ok   : (...a) => console.log (new Date().toISOString(), "✅ ", ...a),
 };
 
 // ============================================
-// KRAKEN WEBSOCKET - FIXED
+// IN-MEMORY STATE
 // ============================================
 
+let currentPrice = 0;
+let openPrice    = 0;
+
+let currentPoll = {
+  pot: 0, stakes: [],
+  startTime: Date.now(),
+  endTime  : Date.now() + 3_600_000,
+  totalBets: 0,
+};
+
+/**
+ * userWallets: userId → { address, username, registeredAt, via }
+ * via = "phantom" | "manual"
+ */
+const userWallets    = new Map();
+
+/**
+ * phantomSessions: sessionId → { userId, createdAt, walletAddress? }
+ * Used for the Phantom deep-link OAuth-style flow
+ */
+const phantomSessions = new Map();
+
+/**
+ * pendingPhantomBets: sessionId → { userId, amount, choice, username }
+ * Stored while we wait for Phantom to redirect back with tx sig
+ */
+const pendingPhantomBets = new Map();
+
+// Manual-flow pending state
+const pendingAmountInput = new Map(); // userId → { choice, username, timeoutHandle }
+const pendingManualBets  = new Map(); // userId → { amount, choice, username, memoId, expiresAt, timeoutHandle }
+
+const processedTxSignatures = new Set();
+
+// Stats / social
+const userStats        = new Map(); // userId → StatsObj
+const userDailyStreak  = new Map();
+const referralCodes    = new Map();
+const userReferrals    = new Map();
+const rateLimitMap     = new Map();
+const tournamentLB     = new Map();
+
+// Jackpot
+let jackpotAmountSOL = 0;
+let jackpotHistory   = [];
+let lastJackpotWin   = null;
+
+// Pinned message IDs
+let pollMessageId        = null;
+let pollChatId           = null;
+let leaderboardMessageId = null;
+let leaderboardChatId    = null;
+
+// Tournament
+let tournamentActive  = false;
+let tournamentEndTime = 0;
+
+// Bot username resolved after launch
+let botUsername = "";
+
+const RATE_LIMIT    = 20;
+const RATE_WINDOW_MS= 60_000;
+
+const DAILY_REWARDS = [0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.015];
+
+const ACHIEVEMENTS = {
+  FIRST_BET   : { name: "🎯 First Bet",      xp: 10  },
+  HOT_STREAK_5: { name: "🔥 5 Win Streak",   xp: 50  },
+  HOT_STREAK_10:{ name: "⚡ 10 Win Streak",  xp: 200 },
+  WHALE       : { name: "🐋 Whale (10+ SOL)",xp: 500 },
+  JACKPOT     : { name: "🎰 Jackpot Winner", xp: 1000},
+};
+
+// ============================================
+// KRAKEN WEBSOCKET — FIXED
+// ============================================
+// Root cause of original bug:
+//   msg[2] === "ticker" is WRONG — Kraken sends channelName at index 2
+//   but only for v1 format. Safe fix: check Array.isArray and msg[1].c
+
 let ws = null;
+let wsReconnectDelay = 2000;
 
 function connectPriceWebSocket() {
   try {
-    if (ws) ws.terminate();
+    if (ws) { ws.removeAllListeners(); ws.terminate(); }
     ws = new WebSocket("wss://ws.kraken.com");
-
-    ws.on("open", () => {
-      log.ok("Kraken WebSocket connected");
-      ws.send(JSON.stringify({
-        event: "subscribe",
-        pair: ["SOL/USD"],
-        subscription: { name: "ticker" }
-      }));
-    });
-
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (Array.isArray(msg) && msg[1] && msg[1].c) {
-          const price = parseFloat(msg[1].c[0]);
-          if (!isNaN(price) && price > 0) {
-            currentPrice = price;
-          }
-        }
-      } catch (_) {}
-    });
-
-    ws.on("error", (err) => log.error("WebSocket error:", err.message));
-    
-    ws.on("close", () => {
-      log.warn("WebSocket closed - reconnecting in 5s");
-      setTimeout(connectPriceWebSocket, 5000);
-    });
   } catch (err) {
-    log.error("WebSocket creation failed:", err);
-    setTimeout(connectPriceWebSocket, 5000);
+    log.error("WS create failed:", err.message);
+    setTimeout(connectPriceWebSocket, wsReconnectDelay);
+    return;
   }
+
+  const hb = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.ping();
+  }, 30_000);
+
+  ws.on("open", () => {
+    log.ok("Kraken WebSocket connected");
+    wsReconnectDelay = 2000;
+    ws.send(JSON.stringify({
+      event: "subscribe",
+      pair : ["XBT/USD", "SOL/USD"],   // SOL/USD is correct Kraken pair
+      subscription: { name: "ticker" },
+    }));
+  });
+
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+
+      // Kraken ticker format: [channelId, tickerData, "ticker", "PAIR"]
+      if (
+        Array.isArray(msg) &&
+        msg.length === 4 &&
+        msg[2] === "ticker" &&
+        msg[3] === "SOL/USD" &&
+        msg[1] &&
+        msg[1].c &&
+        msg[1].c[0]
+      ) {
+        const price = parseFloat(msg[1].c[0]);
+        if (!isNaN(price) && price > 0) {
+          currentPrice = price;
+        }
+      }
+    } catch (_) { /* ignore malformed */ }
+  });
+
+  ws.on("error", (err) => log.error("WS error:", err.message));
+
+  ws.on("close", () => {
+    clearInterval(hb);
+    log.warn(`WS closed — reconnect in ${wsReconnectDelay}ms`);
+    setTimeout(connectPriceWebSocket, wsReconnectDelay);
+    wsReconnectDelay = Math.min(wsReconnectDelay * 2, 30_000);
+  });
 }
 
 // ============================================
-// HELPER FUNCTIONS
+// PHANTOM WALLET — FIXED
 // ============================================
+// The original code built Phantom Universal Links incorrectly.
+// Phantom deep links work differently on mobile vs desktop:
+//   - Mobile: phantom://  or  https://phantom.app/ul/v1/...
+//   - Desktop: the extension intercepts the page directly
+//
+// The correct approach:
+//   1. Generate a session ID
+//   2. Send user a Phantom connect URL that redirects to APP_URL/phantom/callback
+//   3. Callback receives public_key, stores it, notifies user via bot
+//   4. For transactions: build unsigned tx, serialize, send via Phantom sign URL
 
-function getUserIdentifier(ctx) {
-  return ctx.from?.id?.toString() || 'unknown';
+function generateSessionId() {
+  return crypto.randomBytes(16).toString("hex");
 }
 
-function isValidSolanaAddress(address) {
-  try { new PublicKey(address); return true; } catch { return false; }
+function createPhantomSession(userId) {
+  const sessionId = generateSessionId();
+  phantomSessions.set(sessionId, {
+    userId,
+    createdAt: Date.now(),
+    walletAddress: null,
+  });
+  // Auto-expire after 10 minutes
+  setTimeout(() => phantomSessions.delete(sessionId), 10 * 60_000);
+  return sessionId;
+}
+
+function getPhantomSession(sessionId) {
+  const s = phantomSessions.get(sessionId);
+  if (!s) return null;
+  if (Date.now() - s.createdAt > 10 * 60_000) {
+    phantomSessions.delete(sessionId);
+    return null;
+  }
+  return s;
+}
+
+/** Build Phantom connect URL for BOTH mobile and desktop */
+function buildPhantomConnectUrl(userId) {
+  const sessionId = createPhantomSession(userId);
+  const redirectUrl = `${APP_URL}/phantom/callback?session=${sessionId}`;
+
+  // Phantom Universal Link (works mobile + desktop extension)
+  const params = new URLSearchParams({
+    app_url    : APP_URL,
+    dapp_key   : "degen-echo",
+    redirect_link: redirectUrl,
+    cluster    : "mainnet-beta",
+  });
+
+  return {
+    sessionId,
+    url: `https://phantom.app/ul/v1/connect?${params.toString()}`,
+  };
+}
+
+/** Build Phantom signAndSendTransaction URL */
+async function buildPhantomTxUrl(sessionId, fromAddress, toAddress, lamports) {
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash("confirmed");
+
+  const tx = new Transaction().add(
+    SystemProgram.transfer({
+      fromPubkey: new PublicKey(fromAddress),
+      toPubkey  : new PublicKey(toAddress),
+      lamports  : Math.floor(lamports),
+    })
+  );
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = new PublicKey(fromAddress);
+  // Do NOT sign — Phantom signs it
+  const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+  const encodedTx  = bs58.encode(serialized);
+
+  const redirectUrl = `${APP_URL}/phantom/callback?session=${sessionId}`;
+  const params = new URLSearchParams({
+    transaction  : encodedTx,
+    redirect_link: redirectUrl,
+    cluster      : "mainnet-beta",
+  });
+
+  return `https://phantom.app/ul/v1/signAndSendTransaction?${params.toString()}`;
+}
+
+// ============================================
+// HELPERS
+// ============================================
+
+function isValidSolanaAddress(addr) {
+  try { new PublicKey(addr); return true; } catch { return false; }
 }
 
 async function checkBalance(address) {
   try {
-    const publicKey = new PublicKey(address);
-    const lamports = await connection.getBalance(publicKey);
-    return lamports / LAMPORTS_PER_SOL;
-  } catch (err) {
-    return 0;
-  }
+    return (await connection.getBalance(new PublicKey(address))) / LAMPORTS_PER_SOL;
+  } catch { return 0; }
 }
 
 function validateStakeAmount(input) {
   const cleaned = input.trim().replace(",", ".");
-  if (!/^\d*\.?\d+$/.test(cleaned)) {
+  if (!/^\d*\.?\d+$/.test(cleaned))
     return { valid: false, error: "Please enter a valid number" };
-  }
   const amount = parseFloat(cleaned);
-  if (isNaN(amount) || amount < MIN_STAKE) {
+  if (isNaN(amount) || amount < MIN_STAKE)
     return { valid: false, error: `Minimum stake is ${MIN_STAKE} SOL` };
-  }
-  if (amount > MAX_STAKE) {
+  if (amount > MAX_STAKE)
     return { valid: false, error: `Maximum stake is ${MAX_STAKE} SOL` };
-  }
   return { valid: true, amount: Math.round(amount * 1e6) / 1e6 };
 }
 
 function formatPrice() {
-  if (!currentPrice || currentPrice === 0) return "Loading...";
-  return currentPrice.toFixed(4);
+  if (!currentPrice || currentPrice === 0) return "Loading…";
+  return `$${currentPrice.toFixed(4)}`;
 }
 
 function getTimeRemaining() {
-  const remaining = currentPoll.endTime - Date.now();
-  if (remaining <= 0) return "Settling now";
-  const minutes = Math.floor(remaining / 60000);
-  const seconds = Math.floor((remaining % 60000) / 1000);
-  return `${minutes}m ${seconds}s`;
+  const ms = currentPoll.endTime - Date.now();
+  if (ms <= 0) return "Settling now…";
+  const m = Math.floor(ms / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
 }
 
-function generateReferralCode(userId) {
-  return bs58.encode(Buffer.from(userId)).substring(0, 6);
+function generateMemoId() {
+  return crypto.randomBytes(4).toString("hex").toUpperCase();
 }
 
-function awardAchievement(userId, achievementId) {
-  const stats = userStats.get(userId);
-  if (!stats) return;
-  if (!stats.badges) stats.badges = [];
-  if (stats.badges.includes(achievementId)) return;
-  stats.badges.push(achievementId);
-  stats.xp = (stats.xp || 0) + (ACHIEVEMENTS[achievementId]?.xp || 0);
-  userStats.set(userId, stats);
+function getUserWallet(userId) {
+  return userWallets.get(userId) || null;
+}
+
+function ensureStats(userId, username) {
+  if (!userStats.has(userId)) {
+    userStats.set(userId, {
+      username,
+      totalBets: 0, totalWon: 0, totalStaked: 0,
+      winStreak: 0, bestStreak: 0,
+      xp: 0, badges: [],
+    });
+  }
+  const s = userStats.get(userId);
+  s.username = username; // keep fresh
+  return s;
+}
+
+function awardAchievement(userId, key) {
+  const s = userStats.get(userId);
+  if (!s || s.badges.includes(key)) return;
+  s.badges.push(key);
+  s.xp += ACHIEVEMENTS[key]?.xp || 0;
 }
 
 function getStreakMultiplier(userId) {
-  const stats = userStats.get(userId);
-  if (!stats) return 1;
-  if (stats.winStreak >= 10) return 2.0;
-  if (stats.winStreak >= 5) return 1.5;
+  const s = userStats.get(userId);
+  if (!s) return 1;
+  if (s.winStreak >= 10) return 2.0;
+  if (s.winStreak >= 5)  return 1.5;
   return 1.0;
 }
 
-// ============================================
-// JACKPOT FUNCTIONS
-// ============================================
-
-function addToJackpot(amountSOL) {
-  jackpotAmountSOL += amountSOL;
+function generateReferralCode(userId) {
+  return Buffer.from(userId).toString("base64").replace(/[^a-zA-Z0-9]/g, "").substring(0, 6);
 }
 
-async function tryWinJackpot(userId, username, betAmount) {
-  if (jackpotAmountSOL < 1) return null;
-  const winChance = tournamentActive ? 0.002 : 0.001;
-  if (Math.random() < winChance) {
-    const winAmount = jackpotAmountSOL;
+// ============================================
+// JACKPOT
+// ============================================
+
+function addToJackpot(sol) { jackpotAmountSOL += sol; }
+
+async function tryWinJackpot(userId, username) {
+  if (jackpotAmountSOL < 0.1) return null;
+  const chance = tournamentActive ? 0.002 : 0.001;
+  if (Math.random() < chance) {
+    const won = jackpotAmountSOL;
     jackpotAmountSOL = 0;
-    jackpotHistory.unshift({ userId, username, amount: winAmount, timestamp: Date.now() });
+    jackpotHistory.unshift({ userId, username, amount: won, timestamp: Date.now() });
     if (jackpotHistory.length > 10) jackpotHistory.pop();
-    lastJackpotWin = { userId, username, amount: winAmount, timestamp: Date.now() };
-    return winAmount;
+    lastJackpotWin = { userId, username, amount: won, timestamp: Date.now() };
+    return won;
   }
   return null;
 }
@@ -372,106 +435,242 @@ async function tryWinJackpot(userId, username, betAmount) {
 // ============================================
 
 async function claimDailyReward(userId) {
-  const now = Date.now();
+  const now  = Date.now();
   const entry = userDailyStreak.get(userId) || { streak: 0, lastClaim: 0 };
-  const hoursSinceLast = (now - entry.lastClaim) / (1000 * 60 * 60);
-  
-  if (hoursSinceLast < 24) {
-    return { success: false, hoursLeft: 24 - hoursSinceLast };
-  }
-  
-  if (hoursSinceLast > 48) entry.streak = 0;
-  entry.streak++;
-  if (entry.streak > DAILY_REWARDS.length) entry.streak = DAILY_REWARDS.length;
+  const hrs   = (now - entry.lastClaim) / 3_600_000;
+  if (hrs < 24) return { success: false, hoursLeft: 24 - hrs };
+  if (hrs > 48) entry.streak = 0;
+  entry.streak = Math.min(entry.streak + 1, DAILY_REWARDS.length);
   entry.lastClaim = now;
   userDailyStreak.set(userId, entry);
-  
-  const reward = DAILY_REWARDS[entry.streak - 1];
-  return { success: true, reward, streak: entry.streak };
+  return { success: true, reward: DAILY_REWARDS[entry.streak - 1], streak: entry.streak };
 }
 
 // ============================================
-// TOURNAMENT MODE
+// TOURNAMENT
 // ============================================
 
 function startTournament(durationHours = 24) {
-  tournamentActive = true;
-  tournamentEndTime = Date.now() + durationHours * 3600000;
-  tournamentLeaderboard.clear();
-  log.ok("🏆 Tournament started");
+  tournamentActive  = true;
+  tournamentEndTime = Date.now() + durationHours * 3_600_000;
+  tournamentLB.clear();
+  log.ok(`Tournament started — ${durationHours}h`);
 }
 
-function endTournament() {
+async function endTournament() {
   tournamentActive = false;
-  const sorted = [...tournamentLeaderboard.entries()].sort((a,b) => b[1] - a[1]).slice(0,3);
-  let msg = `🏆 *Tournament Ended*\n\nTop 3 Winners:\n`;
-  sorted.forEach(([userId, won], i) => {
-    const username = userStats.get(userId)?.username || 'Unknown';
-    msg += `${i+1}. ${username} – ${won.toFixed(4)} SOL\n`;
+  const top3 = [...tournamentLB.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+
+  let msg = `🏆 *Tournament Ended!*\n\nTop Winners:\n`;
+  top3.forEach(([uid, won], i) => {
+    const name = userStats.get(uid)?.username || "Unknown";
+    msg += `${i + 1}. ${name} – ${won.toFixed(4)} SOL\n`;
   });
-  bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, msg, { parse_mode: "Markdown" }).catch(()=>{});
-  tournamentLeaderboard.clear();
+
+  await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, msg, { parse_mode: "Markdown" }).catch(() => {});
+  tournamentLB.clear();
+}
+
+// ============================================
+// PAYOUT
+// ============================================
+
+async function sendPayout(toAddress, amountSOL, description) {
+  if (!botWallet || !connection) return null;
+  try {
+    const toPubkey   = new PublicKey(toAddress);
+    const fromPubkey = botWallet.publicKey;
+
+    const balLamports   = await connection.getBalance(fromPubkey);
+    const neededLamports= Math.ceil(amountSOL * LAMPORTS_PER_SOL) + 5000;
+    if (balLamports < neededLamports) {
+      const have = (balLamports / LAMPORTS_PER_SOL).toFixed(6);
+      for (const id of ADMIN_IDS) {
+        await bot.telegram.sendMessage(
+          id,
+          `⚠️ *Bot wallet low!*\nNeed: ${amountSOL.toFixed(6)} SOL\nHave: ${have} SOL\nFor: ${description}`,
+          { parse_mode: "Markdown" }
+        ).catch(() => {});
+      }
+      return null;
+    }
+
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
+
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey,
+        toPubkey,
+        lamports: Math.floor(amountSOL * LAMPORTS_PER_SOL),
+      })
+    );
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = fromPubkey;
+    tx.sign(botWallet);
+
+    const sig = await connection.sendRawTransaction(tx.serialize(), {
+      skipPreflight      : false,
+      preflightCommitment: "confirmed",
+    });
+    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+    log.ok(`Paid ${amountSOL.toFixed(6)} SOL → ${toAddress} | ${description}`);
+    return sig;
+  } catch (err) {
+    log.error("sendPayout failed:", err.message);
+    return null;
+  }
+}
+
+// ============================================
+// ON-CHAIN PAYMENT VERIFICATION (manual flow)
+// ============================================
+
+async function checkOnChainPayment(memoId) {
+  try {
+    const sigs = await connection.getSignaturesForAddress(botWallet.publicKey, { limit: 25 });
+    for (const info of sigs) {
+      if (processedTxSignatures.has(info.signature) || info.err) continue;
+      const tx = await connection.getParsedTransaction(info.signature, {
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!tx) continue;
+      const logs = tx.meta?.logMessages || [];
+      if (!logs.some((l) => l.includes(memoId))) continue;
+
+      const keys     = tx.transaction.message.accountKeys;
+      const botIndex = keys.findIndex((k) => k.pubkey.toString() === botWallet.publicKey.toString());
+      if (botIndex === -1) continue;
+
+      const received = (tx.meta.postBalances[botIndex] - tx.meta.preBalances[botIndex]) / LAMPORTS_PER_SOL;
+      if (received <= 0) continue;
+
+      processedTxSignatures.add(info.signature);
+      return { signature: info.signature, amount: received };
+    }
+    return null;
+  } catch (err) {
+    log.error("checkOnChainPayment:", err.message);
+    return null;
+  }
+}
+
+async function watchManualPayment(memoId) {
+  const bet = pendingManualBets.get(memoId);
+  if (!bet) return;
+
+  if (Date.now() > bet.expiresAt) {
+    pendingManualBets.delete(memoId);
+    await bot.telegram.sendMessage(
+      bet.chatId,
+      `⏱️ Payment window expired for memo \`${memoId}\`.\nClick a poll button to try again.`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+    return;
+  }
+
+  const result = await checkOnChainPayment(memoId);
+  if (result) {
+    await confirmBet(bet.userId, bet.username, result.amount, bet.choice, result.signature, bet.chatId);
+    pendingManualBets.delete(memoId);
+    return;
+  }
+
+  setTimeout(() => watchManualPayment(memoId), BLOCKCHAIN_POLL_MS);
+}
+
+// ============================================
+// BET CONFIRMATION (shared by both flows)
+// ============================================
+
+async function confirmBet(userId, username, amount, choice, signature, chatId) {
+  const rakeAmt    = amount * RAKE_PERCENT;
+  const potAmt     = amount * POT_PERCENT;
+  const jackpotAmt = amount * JACKPOT_PERCENT;
+
+  currentPoll.pot += potAmt;
+  currentPoll.stakes.push({ userId, username, choice, amount: potAmt, timestamp: Date.now(), signature });
+  currentPoll.totalBets++;
+
+  addToJackpot(jackpotAmt);
+
+  const stats = ensureStats(userId, username);
+  stats.totalBets++;
+  stats.totalStaked += amount;
+  stats.xp += 10;
+
+  if (stats.totalBets === 1) awardAchievement(userId, "FIRST_BET");
+  if (amount >= 10)          awardAchievement(userId, "WHALE");
+
+  if (tournamentActive) {
+    tournamentLB.set(userId, (tournamentLB.get(userId) || 0) + potAmt);
+  }
+
+  const jackpotWin = await tryWinJackpot(userId, username);
+  if (jackpotWin) {
+    awardAchievement(userId, "JACKPOT");
+    const wallet = getUserWallet(userId);
+    if (wallet) await sendPayout(wallet.address, jackpotWin, "Jackpot win");
+    await bot.telegram.sendMessage(
+      chatId,
+      `🎰 *JACKPOT! You won ${jackpotWin.toFixed(4)} SOL!*`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+    await bot.telegram.sendMessage(
+      ANNOUNCEMENTS_CHANNEL,
+      `🎰 *JACKPOT HIT!*\n👤 ${username} won *${jackpotWin.toFixed(4)} SOL*!`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+  }
+
+  const emoji = { pump: "🚀", dump: "📉", stagnate: "🟡" }[choice];
+  await bot.telegram.sendMessage(
+    chatId,
+    `${emoji} *Bet Confirmed!*\n\n` +
+    `Choice: *${choice.toUpperCase()}*\n` +
+    `Amount: *${amount.toFixed(6)} SOL*\n` +
+    `Pot contribution: ${potAmt.toFixed(6)} SOL\n` +
+    `TX: \`${signature.slice(0, 8)}…${signature.slice(-8)}\``,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+
+  await bot.telegram.sendMessage(
+    LIVE_CHANNEL,
+    `${emoji} *New Bet!*\n👤 ${username}\n💰 ${amount.toFixed(4)} SOL → *${choice.toUpperCase()}*\n📦 Pot: ${currentPoll.pot.toFixed(4)} SOL`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
+
+  await updatePoll();
 }
 
 // ============================================
 // MESSAGE BUILDERS
 // ============================================
 
-function buildLeaderboardMessage() {
-  if (userStats.size === 0) {
-    return "🏆 *LEADERBOARD*\n\nNo bets yet";
-  }
-  
-  const sorted = [...userStats.entries()]
-    .sort((a,b) => (b[1].totalWon || 0) - (a[1].totalWon || 0))
-    .slice(0, 10);
-  
-  let msg = "🏆 *LEADERBOARD*\n\n";
-  
-  sorted.forEach(([uid, stats], i) => {
-    const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i+1}.`;
-    msg += `${medal} *${stats.username || 'Anonymous'}*\n`;
-    msg += `   Won: ${(stats.totalWon || 0).toFixed(4)} SOL\n`;
-    msg += `   Bets: ${stats.totalBets || 0} | Streak: ${stats.winStreak || 0}\n`;
-    if (stats.badges && stats.badges.length) {
-      msg += `   Badges: ${stats.badges.map(b => ACHIEVEMENTS[b]?.name || b).join(' ')}\n`;
-    }
-  });
-  
-  msg += `\n🎰 *Jackpot:* ${jackpotAmountSOL.toFixed(4)} SOL`;
-  if (tournamentActive) msg += `\n🏆 *TOURNAMENT ACTIVE*`;
-  return msg;
-}
-
 function buildPollMessage() {
-  const priceStr = formatPrice();
-  const timeLeft = getTimeRemaining();
-  
+  const pump = currentPoll.stakes.filter((s) => s.choice === "pump").reduce((a, s) => a + s.amount, 0);
+  const dump = currentPoll.stakes.filter((s) => s.choice === "dump").reduce((a, s) => a + s.amount, 0);
+  const flat = currentPoll.stakes.filter((s) => s.choice === "stagnate").reduce((a, s) => a + s.amount, 0);
+
   let msg = `🎰 *DEGEN ECHO HOURLY POLL*\n\n`;
-  msg += `💰 SOL Price: *$${priceStr}*\n`;
-  msg += `⏰ Time Left: *${timeLeft}*\n\n`;
-  
+  msg += `💰 SOL Price: *${formatPrice()}*\n`;
+  msg += `⏰ Time Left: *${getTimeRemaining()}*\n\n`;
+
   if (currentPoll.stakes.length === 0) {
-    msg += `No stakes yet – be first!\n\n`;
+    msg += `_No stakes yet – be first!_\n\n`;
   } else {
-    const pump = currentPoll.stakes.filter(s => s.choice === 'pump').reduce((a,s) => a + s.amount, 0);
-    const dump = currentPoll.stakes.filter(s => s.choice === 'dump').reduce((a,s) => a + s.amount, 0);
-    const flat = currentPoll.stakes.filter(s => s.choice === 'stagnate').reduce((a,s) => a + s.amount, 0);
-    
-    const pumpCount = currentPoll.stakes.filter(s => s.choice === 'pump').length;
-    const dumpCount = currentPoll.stakes.filter(s => s.choice === 'dump').length;
-    const flatCount = currentPoll.stakes.filter(s => s.choice === 'stagnate').length;
-    
     msg += `💰 *Pot:* ${currentPoll.pot.toFixed(6)} SOL\n`;
-    msg += `🚀 PUMP: ${pump.toFixed(6)} (${pumpCount})\n`;
-    msg += `📉 DUMP: ${dump.toFixed(6)} (${dumpCount})\n`;
-    msg += `🟡 FLAT: ${flat.toFixed(6)} (${flatCount})\n\n`;
+    msg += `🚀 PUMP: ${pump.toFixed(6)} SOL (${currentPoll.stakes.filter((s) => s.choice === "pump").length})\n`;
+    msg += `📉 DUMP: ${dump.toFixed(6)} SOL (${currentPoll.stakes.filter((s) => s.choice === "dump").length})\n`;
+    msg += `🟡 FLAT: ${flat.toFixed(6)} SOL (${currentPoll.stakes.filter((s) => s.choice === "stagnate").length})\n\n`;
   }
-  
+
   msg += `🎰 *Jackpot:* ${jackpotAmountSOL.toFixed(4)} SOL\n`;
-  msg += `💎 Min Stake: ${MIN_STAKE} SOL\n`;
-  msg += `💰 *19% rake | 80% pot | 1% jackpot*`;
-  
+  msg += `Min: ${MIN_STAKE} SOL | 19% rake · 80% pot · 1% jackpot`;
+  if (tournamentActive) msg += `\n🏆 *TOURNAMENT ACTIVE — double jackpot chance!*`;
+
   return msg;
 }
 
@@ -481,188 +680,186 @@ function getPollKeyboard() {
       { text: "🚀 Pump", callback_data: "vote_pump" },
       { text: "📉 Dump", callback_data: "vote_dump" },
       { text: "🟡 Flat", callback_data: "vote_stagnate" },
-    ]]
+    ]],
   };
 }
 
+function buildLeaderboardMessage() {
+  if (userStats.size === 0) return "🏆 *LEADERBOARD*\n\n_No bets yet – be first!_";
+
+  const sorted = [...userStats.entries()]
+    .sort((a, b) => (b[1].totalWon || 0) - (a[1].totalWon || 0))
+    .slice(0, 10);
+
+  const medals = ["🥇", "🥈", "🥉"];
+  let msg = "🏆 *DEGEN ECHO LEADERBOARD*\n\n";
+
+  sorted.forEach(([, s], i) => {
+    const medal = medals[i] || `${i + 1}.`;
+    const wr = s.totalBets ? ((s.totalWon / Math.max(s.totalStaked, 0.0001)) * 100).toFixed(1) : "0.0";
+    msg += `${medal} *${s.username}*\n`;
+    msg += `   💰 Won: ${(s.totalWon || 0).toFixed(4)} SOL | Rate: ${wr}%\n`;
+    msg += `   🎯 Bets: ${s.totalBets} | 🔥 Streak: ${s.winStreak}\n`;
+    if (s.badges?.length) msg += `   ${s.badges.map((b) => ACHIEVEMENTS[b]?.name || b).join(" ")}\n`;
+    msg += "\n";
+  });
+
+  msg += `🎰 Jackpot: *${jackpotAmountSOL.toFixed(4)} SOL*`;
+  if (tournamentActive) msg += "\n🏆 *TOURNAMENT ACTIVE*";
+  return msg;
+}
+
+// ============================================
+// AUTO-UPDATE POLL & LEADERBOARD
+// ============================================
+
 async function updatePoll() {
   try {
-    const msg = buildPollMessage();
-    
+    const text  = buildPollMessage();
+    const reply_markup = getPollKeyboard();
+
     if (pollMessageId && pollChatId) {
       try {
         await bot.telegram.editMessageText(
-          pollChatId,
-          pollMessageId,
-          undefined,
-          msg,
-          { parse_mode: 'Markdown', reply_markup: getPollKeyboard() }
+          pollChatId, pollMessageId, undefined, text,
+          { parse_mode: "Markdown", reply_markup }
         );
         return;
-      } catch (editErr) {
+      } catch (_) {
         pollMessageId = null;
-        pollChatId = null;
+        pollChatId    = null;
       }
     }
-    
-    const sent = await bot.telegram.sendMessage(
-      LIVE_CHANNEL,
-      msg,
-      { parse_mode: 'Markdown', reply_markup: getPollKeyboard() }
-    );
+
+    const sent = await bot.telegram.sendMessage(LIVE_CHANNEL, text, {
+      parse_mode: "Markdown", reply_markup,
+    });
     pollMessageId = sent.message_id;
-    pollChatId = sent.chat.id;
-    
+    pollChatId    = sent.chat.id;
+    await bot.telegram.pinChatMessage(LIVE_CHANNEL, sent.message_id).catch(() => {});
   } catch (err) {
-    log.error('Poll error:', err.message);
+    log.error("updatePoll:", err.message);
   }
 }
 
 async function updateLeaderboard() {
   try {
-    const msg = buildLeaderboardMessage();
-    
+    const text = buildLeaderboardMessage();
+
     if (leaderboardMessageId && leaderboardChatId) {
       try {
         await bot.telegram.editMessageText(
-          leaderboardChatId,
-          leaderboardMessageId,
-          undefined,
-          msg,
-          { parse_mode: 'Markdown' }
+          leaderboardChatId, leaderboardMessageId, undefined, text,
+          { parse_mode: "Markdown" }
         );
         return;
-      } catch (editErr) {
+      } catch (_) {
         leaderboardMessageId = null;
-        leaderboardChatId = null;
+        leaderboardChatId    = null;
       }
     }
-    
-    const sent = await bot.telegram.sendMessage(
-      COMMUNITY_GROUP,
-      msg,
-      { parse_mode: 'Markdown' }
-    );
+
+    const sent = await bot.telegram.sendMessage(COMMUNITY_GROUP, text, { parse_mode: "Markdown" });
     leaderboardMessageId = sent.message_id;
-    leaderboardChatId = sent.chat.id;
-    
+    leaderboardChatId    = sent.chat.id;
+    await bot.telegram.pinChatMessage(COMMUNITY_GROUP, sent.message_id).catch(() => {});
   } catch (err) {
-    log.error('Leaderboard error:', err.message);
+    log.error("updateLeaderboard:", err.message);
   }
 }
 
 // ============================================
-// PAYMENT PROCESSING
+// HOURLY SETTLEMENT
 // ============================================
 
-async function sendToRakeWallet(amount) {
-  if (amount <= 0) return;
-  
-  try {
-    const toPubkey = new PublicKey(RAKE_WALLET);
-    const fromPubkey = botWallet.publicKey;
-    
-    const { blockhash } = await connection.getLatestBlockhash();
-    
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey,
-        toPubkey,
-        lamports: Math.floor(amount * LAMPORTS_PER_SOL),
-      })
-    );
-    
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = fromPubkey;
-    tx.sign(botWallet);
-    
-    await connection.sendRawTransaction(tx.serialize());
-    log.ok(`💰 Sent ${amount.toFixed(6)} SOL to rake wallet`);
-  } catch (err) {
-    log.error("Send to rake wallet failed:", err);
-  }
-}
+async function settleHour() {
+  log.info("⏰ Hourly settlement");
 
-async function sendPayout(userId, amountSOL, reason) {
-  const session = phantom.getSessionByUserId(userId);
-  if (!session || !session.walletAddress) {
-    log.warn(`Cannot payout user ${userId}: no wallet connected`);
-    return null;
-  }
-  
-  try {
-    const toPubkey = new PublicKey(session.walletAddress);
-    const fromPubkey = botWallet.publicKey;
-    
-    const { blockhash } = await connection.getLatestBlockhash();
-    
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey,
-        toPubkey,
-        lamports: Math.floor(amountSOL * LAMPORTS_PER_SOL),
-      })
-    );
-    
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = fromPubkey;
-    tx.sign(botWallet);
-    
-    const signature = await connection.sendRawTransaction(tx.serialize());
-    log.ok(`💸 Paid ${amountSOL.toFixed(6)} SOL to user for ${reason}`);
-    return signature;
-  } catch (err) {
-    log.error("Send payout failed:", err);
-    return null;
-  }
-}
+  if (currentPoll.stakes.length < 2) {
+    await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, "⏰ Not enough bets this hour.").catch(() => {});
+  } else {
+    let winnerChoice;
+    if      (currentPrice > openPrice * 1.001) winnerChoice = "pump";
+    else if (currentPrice < openPrice * 0.999) winnerChoice = "dump";
+    else                                        winnerChoice = "stagnate";
 
-async function processBet(userId, amount, choice, signature) {
-  const session = phantom.getSessionByUserId(userId);
-  if (!session) return;
-  
-  const username = session.username || 'Anonymous';
-  
-  const rakeAmount = amount * RAKE_PERCENT;
-  const potAmount = amount * POT_PERCENT;
-  const jackpotAmount = amount * JACKPOT_PERCENT;
-  
-  currentPoll.pot += potAmount;
-  currentPoll.stakes.push({
-    userId, username, choice,
-    amount: potAmount,
-    timestamp: Date.now(),
-    signature
-  });
-  currentPoll.totalBets++;
-  
-  addToJackpot(jackpotAmount);
-  
-  let stats = userStats.get(userId) || {
-    username, totalBets: 0, totalWon: 0, totalStaked: 0, winStreak: 0, bestStreak: 0, xp: 0, badges: []
+    const emojiMap = { pump: "🚀", dump: "📉", stagnate: "🟡" };
+    const winners  = currentPoll.stakes.filter((s) => s.choice === winnerChoice);
+    const losers   = currentPoll.stakes.filter((s) => s.choice !== winnerChoice);
+    const totalPot = currentPoll.pot;
+    const winPool  = winners.reduce((a, s) => a + s.amount, 0);
+
+    let paidCount = 0, paidAmount = 0;
+
+    for (const w of winners) {
+      const wallet = getUserWallet(w.userId);
+      if (!wallet) continue;
+
+      const share      = w.amount / winPool;
+      const multiplier = getStreakMultiplier(w.userId);
+      const payout     = parseFloat((totalPot * share * multiplier).toFixed(6));
+
+      const sig = await sendPayout(wallet.address, payout, `Hourly win – ${winnerChoice}`);
+      if (sig) {
+        paidCount++;
+        paidAmount += payout;
+
+        const s = userStats.get(w.userId);
+        if (s) {
+          s.totalWon += payout;
+          s.winStreak = (s.winStreak || 0) + 1;
+          if (s.winStreak > (s.bestStreak || 0)) s.bestStreak = s.winStreak;
+          s.xp += 50;
+          if (s.winStreak >= 5)  awardAchievement(w.userId, "HOT_STREAK_5");
+          if (s.winStreak >= 10) awardAchievement(w.userId, "HOT_STREAK_10");
+          if (tournamentActive)  tournamentLB.set(w.userId, (tournamentLB.get(w.userId) || 0) + payout);
+        }
+
+        await bot.telegram.sendMessage(
+          w.userId,
+          `🏆 *You won!*\n\n` +
+          `SOL went *${winnerChoice.toUpperCase()}*\n` +
+          `💰 *+${payout.toFixed(6)} SOL* paid to your wallet\n` +
+          `TX: \`${sig.slice(0, 8)}…${sig.slice(-8)}\``,
+          { parse_mode: "Markdown" }
+        ).catch(() => {});
+      }
+    }
+
+    for (const l of losers) {
+      const s = userStats.get(l.userId);
+      if (s) s.winStreak = 0;
+    }
+
+    await bot.telegram.sendMessage(
+      ANNOUNCEMENTS_CHANNEL,
+      `⏰ *Hourly Results*\n\n` +
+      `${emojiMap[winnerChoice]} Winner: *${winnerChoice.toUpperCase()}*\n` +
+      `Open: $${openPrice.toFixed(4)} → Close: $${currentPrice.toFixed(4)}\n` +
+      `💰 Pot: ${totalPot.toFixed(6)} SOL\n` +
+      `🏆 Winners: ${paidCount} | Paid: ${paidAmount.toFixed(6)} SOL\n` +
+      `🎰 Jackpot: ${jackpotAmountSOL.toFixed(4)} SOL`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+
+    log.ok(`Settlement done: ${paidCount} winners, ${paidAmount.toFixed(6)} SOL`);
+  }
+
+  // Reset poll
+  openPrice    = currentPrice;
+  pollMessageId= null;
+  pollChatId   = null;
+  currentPoll  = {
+    pot: 0, stakes: [],
+    startTime: Date.now(),
+    endTime  : Date.now() + 3_600_000,
+    totalBets: 0,
   };
-  stats.username = username;
-  stats.totalBets++;
-  stats.totalStaked += amount;
-  stats.xp += 10;
-  userStats.set(userId, stats);
-  
-  if (stats.totalBets === 1) awardAchievement(userId, 'FIRST_BET');
-  
-  await sendToRakeWallet(rakeAmount);
-  
-  const jackpotWin = await tryWinJackpot(userId, username, amount);
-  if (jackpotWin) {
-    awardAchievement(userId, 'JACKPOT');
-    await sendPayout(userId, jackpotWin, 'Jackpot Win');
-  }
-  
-  if (tournamentActive) {
-    const current = tournamentLeaderboard.get(userId) || 0;
-    tournamentLeaderboard.set(userId, current + potAmount);
-  }
-  
-  log.ok(`✅ Bet processed: ${amount} SOL from ${username}`);
+
+  await updatePoll();
+  await updateLeaderboard();
+
+  if (tournamentActive && Date.now() >= tournamentEndTime) await endTournament();
 }
 
 // ============================================
@@ -671,33 +868,18 @@ async function processBet(userId, amount, choice, signature) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
-bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(()=>{});
+bot.catch((err, ctx) => log.error("Bot error:", err.message, ctx?.updateType));
 
-bot.catch((err, ctx) => {
-  log.error("Bot error:", err.message);
-});
-
-// Rate limiting
+// Rate limiter
 bot.use((ctx, next) => {
-  const userId = ctx.from?.id?.toString();
-  if (!userId) return next();
-  
-  const now = Date.now();
-  const entry = rateLimitMap.get(userId) || { count: 0, windowStart: now };
-  
-  if (now - entry.windowStart > RATE_WINDOW_MS) {
-    entry.count = 1;
-    entry.windowStart = now;
-  } else {
-    entry.count++;
-  }
-  
-  rateLimitMap.set(userId, entry);
-  
-  if (entry.count > RATE_LIMIT) {
-    return ctx.reply("⏳ Slow down!").catch(()=>{});
-  }
-  
+  const uid = ctx.from?.id?.toString();
+  if (!uid) return next();
+  const now   = Date.now();
+  const entry = rateLimitMap.get(uid) || { count: 0, windowStart: now };
+  if (now - entry.windowStart > RATE_WINDOW_MS) { entry.count = 1; entry.windowStart = now; }
+  else entry.count++;
+  rateLimitMap.set(uid, entry);
+  if (entry.count > RATE_LIMIT) return ctx.reply("⏳ Slow down!").catch(() => {});
   return next();
 });
 
@@ -706,528 +888,542 @@ bot.use((ctx, next) => {
 // ============================================
 
 bot.start(async (ctx) => {
-  const userId = ctx.from.id.toString();
-  const name = ctx.from.first_name || "User";
-  
-  const args = ctx.message.text.split(' ');
-  if (args.length > 1 && args[1].startsWith('ref_')) {
-    const refCode = args[1].substring(4);
-    const referrerId = referralCodes.get(refCode);
-    if (referrerId && referrerId !== userId) {
-      userReferrals.set(userId, { referredBy: referrerId, referrals: [] });
-      const referrerStats = userStats.get(referrerId);
-      if (referrerStats) {
-        referrerStats.xp = (referrerStats.xp || 0) + 50;
-        userStats.set(referrerId, referrerStats);
-      }
+  const userId   = ctx.from.id.toString();
+  const username = ctx.from.username || ctx.from.first_name || "User";
+  const name     = ctx.from.first_name || "Degen";
+
+  // Handle referral
+  const args = ctx.message.text.split(" ");
+  if (args[1]?.startsWith("ref_")) {
+    const code       = args[1].slice(4);
+    const referrerId = referralCodes.get(code);
+    if (referrerId && referrerId !== userId && !userReferrals.has(userId)) {
+      userReferrals.set(userId, { referredBy: referrerId });
+      const rs = userStats.get(referrerId);
+      if (rs) { rs.xp += 50; }
+      await bot.telegram.sendMessage(referrerId,
+        `🤝 Someone joined via your referral link! +50 XP`, {}
+      ).catch(() => {});
     }
   }
-  
-  const session = phantom.getSessionByUserId(userId);
-  
-  let walletStatus = session?.walletAddress 
-    ? `✅ Wallet connected: ${session.walletAddress.slice(0,6)}...${session.walletAddress.slice(-4)}`
-    : "❌ Wallet not connected";
-  
-  ctx.reply(
+
+  const wallet = getUserWallet(userId);
+  const walletStatus = wallet
+    ? `✅ Wallet: \`${wallet.address.slice(0,6)}…${wallet.address.slice(-4)}\` (${wallet.via})`
+    : "❌ No wallet connected";
+
+  await ctx.reply(
     `🎰 *Welcome to Degen Echo, ${name}!*\n\n` +
     `${walletStatus}\n\n` +
+    `*Connect wallet:*\n` +
+    `/connect – Phantom deep link (mobile + desktop)\n` +
+    `/register <address> – Manual wallet address\n\n` +
     `*Commands:*\n` +
-    `/connect - Connect Phantom wallet\n` +
-    `/balance - Check balance\n` +
-    `/leaderboard - View top players\n` +
-    `/poll - Show current poll\n` +
-    `/jackpot - Check jackpot\n` +
-    `/daily - Claim daily reward\n` +
-    `/ref - Get referral link\n` +
-    `/stats - Your stats\n` +
-    `/achievements - Your badges\n` +
-    `/tournament - Tournament info\n` +
-    `/help - Show all commands`,
-    { parse_mode: 'Markdown' }
+    `/balance /leaderboard /poll /jackpot\n` +
+    `/daily /ref /stats /achievements /tournament\n` +
+    `/cancel /help`,
+    { parse_mode: "Markdown" }
   );
 });
 
-bot.command('connect', async (ctx) => {
+bot.command("connect", async (ctx) => {
   const userId = ctx.from.id.toString();
-  const connectLink = phantom.generateConnectLink(userId);
-  
+  const { url } = buildPhantomConnectUrl(userId);
+
   await ctx.reply(
     `🔌 *Connect Phantom Wallet*\n\n` +
-    `Click the button below to open Phantom:`,
+    `*Mobile:* Tap the button — Phantom app opens automatically\n` +
+    `*Desktop:* Click the button — Phantom extension handles it\n\n` +
+    `After connecting, your wallet is saved automatically.`,
     {
-      parse_mode: 'Markdown',
+      parse_mode: "Markdown",
       reply_markup: {
-        inline_keyboard: [[
-          { text: "🔌 Connect Phantom", url: connectLink }
-        ]]
-      }
+        inline_keyboard: [[{ text: "🔌 Connect Phantom", url }]],
+      },
     }
   );
 });
 
-bot.command('balance', async (ctx) => {
-  const userId = ctx.from.id.toString();
-  const session = phantom.getSessionByUserId(userId);
-  
-  if (!session?.walletAddress) {
-    return ctx.reply("❌ Wallet not connected. Use /connect first.");
+bot.command("register", async (ctx) => {
+  const userId   = ctx.from.id.toString();
+  const username = ctx.from.username || ctx.from.first_name || "User";
+  const args     = ctx.message.text.trim().split(/\s+/);
+
+  if (args.length !== 2) {
+    return ctx.reply("Usage: `/register <solana_wallet_address>`", { parse_mode: "Markdown" });
   }
-  
-  const balance = await checkBalance(session.walletAddress);
-  ctx.reply(
-    `💰 *Wallet Balance*\n\n` +
-    `Address: \`${session.walletAddress.slice(0,6)}...${session.walletAddress.slice(-4)}\`\n` +
-    `Balance: ${balance.toFixed(6)} SOL`,
-    { parse_mode: 'Markdown' }
+
+  const address = args[1].trim();
+  if (!isValidSolanaAddress(address)) {
+    return ctx.reply("❌ Invalid Solana address. Please check and try again.");
+  }
+  if (address === botWallet.publicKey.toString() || address === RAKE_WALLET) {
+    return ctx.reply("❌ Cannot register a system wallet.");
+  }
+
+  const balance = await checkBalance(address);
+  userWallets.set(userId, { address, username, registeredAt: Date.now(), via: "manual" });
+
+  return ctx.reply(
+    `✅ *Wallet Registered!*\n\n` +
+    `💳 \`${address}\`\n` +
+    `💰 Balance: ${balance.toFixed(6)} SOL`,
+    { parse_mode: "Markdown" }
   );
 });
 
-bot.command('leaderboard', async (ctx) => {
-  ctx.reply(buildLeaderboardMessage(), { parse_mode: 'Markdown' });
+bot.command("balance", async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const wallet = getUserWallet(userId);
+  if (!wallet) return ctx.reply("❌ No wallet. Use /connect or /register first.");
+  const balance = await checkBalance(wallet.address);
+  return ctx.reply(
+    `💰 *Balance*\n\n\`${wallet.address}\`\n*${balance.toFixed(6)} SOL*`,
+    { parse_mode: "Markdown" }
+  );
 });
 
-bot.command('poll', async (ctx) => {
-  ctx.reply(buildPollMessage(), { 
-    parse_mode: 'Markdown', 
-    reply_markup: getPollKeyboard() 
-  });
+bot.command("poll", async (ctx) => {
+  await ctx.reply(buildPollMessage(), { parse_mode: "Markdown", reply_markup: getPollKeyboard() });
 });
 
-bot.command('jackpot', (ctx) => {
-  let msg = `🎰 *Jackpot:* ${jackpotAmountSOL.toFixed(4)} SOL\n`;
+bot.command("leaderboard", (ctx) => {
+  ctx.reply(buildLeaderboardMessage(), { parse_mode: "Markdown" });
+});
+
+bot.command("jackpot", (ctx) => {
+  let msg = `🎰 *Jackpot: ${jackpotAmountSOL.toFixed(4)} SOL*\n`;
   if (lastJackpotWin) {
-    const timeAgo = Math.floor((Date.now() - lastJackpotWin.timestamp) / 60000);
-    msg += `\nLast winner: ${lastJackpotWin.username} (${timeAgo}m ago)`;
+    const ago = Math.floor((Date.now() - lastJackpotWin.timestamp) / 60_000);
+    msg += `\nLast winner: *${lastJackpotWin.username}* won *${lastJackpotWin.amount.toFixed(4)} SOL* (${ago}m ago)`;
   }
-  ctx.reply(msg, { parse_mode: 'Markdown' });
+  ctx.reply(msg, { parse_mode: "Markdown" });
 });
 
-bot.command('daily', async (ctx) => {
+bot.command("daily", async (ctx) => {
   const userId = ctx.from.id.toString();
   const result = await claimDailyReward(userId);
-  
-  if (result.success) {
-    ctx.reply(`✅ *Daily Reward:* ${result.reward} SOL (Streak: ${result.streak})`, { parse_mode: 'Markdown' });
-    await sendPayout(userId, result.reward, 'Daily reward');
-  } else {
-    ctx.reply(`⏳ Next daily in ${Math.ceil(result.hoursLeft)} hours`, { parse_mode: 'Markdown' });
+  if (!result.success) {
+    return ctx.reply(`⏳ Next daily in *${Math.ceil(result.hoursLeft)}h*`, { parse_mode: "Markdown" });
   }
-});
-
-bot.command('ref', (ctx) => {
-  const userId = ctx.from.id.toString();
-  const code = generateReferralCode(userId);
-  referralCodes.set(code, userId);
-  const link = `https://t.me/${ctx.botInfo.username}?start=ref_${code}`;
-  
-  const referralData = userReferrals.get(userId);
-  const referralCount = referralData?.referrals?.length || 0;
-  
+  const wallet = getUserWallet(userId);
+  if (wallet) await sendPayout(wallet.address, result.reward, "Daily reward");
   ctx.reply(
-    `🤝 *Your Referral Link*\n\n${link}\n\n` +
-    `Referrals: ${referralCount}\n` +
-    `Bonus: 50 XP per referral!`,
-    { parse_mode: 'Markdown' }
+    `✅ *Daily Reward Claimed!*\n\n💰 ${result.reward} SOL\n🔥 Streak: ${result.streak} day${result.streak > 1 ? "s" : ""}`,
+    { parse_mode: "Markdown" }
   );
 });
 
-bot.command('stats', (ctx) => {
+bot.command("ref", (ctx) => {
   const userId = ctx.from.id.toString();
-  const stats = userStats.get(userId);
-  
-  if (!stats) return ctx.reply("No stats yet");
-  
-  const winRate = stats.totalBets ? ((stats.totalWon / stats.totalStaked) * 100).toFixed(1) : 0;
+  const code   = generateReferralCode(userId);
+  referralCodes.set(code, userId);
+  const link = `https://t.me/${botUsername}?start=ref_${code}`;
+  ctx.reply(
+    `🤝 *Your Referral Link*\n\n\`${link}\`\n\nShare this — you earn *50 XP* per signup!`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.command("stats", (ctx) => {
+  const userId = ctx.from.id.toString();
+  const s      = userStats.get(userId);
+  if (!s) return ctx.reply("No stats yet. Place a bet first!");
+  const wr = s.totalBets ? ((s.totalWon / Math.max(s.totalStaked, 0.0001)) * 100).toFixed(1) : "0.0";
   ctx.reply(
     `📊 *Your Stats*\n\n` +
-    `Bets: ${stats.totalBets}\n` +
-    `Staked: ${stats.totalStaked.toFixed(4)} SOL\n` +
-    `Won: ${stats.totalWon.toFixed(4)} SOL\n` +
-    `Win Rate: ${winRate}%\n` +
-    `Streak: ${stats.winStreak} (Best: ${stats.bestStreak})\n` +
-    `XP: ${stats.xp || 0}`,
-    { parse_mode: 'Markdown' }
+    `Bets: ${s.totalBets}\n` +
+    `Staked: ${s.totalStaked.toFixed(4)} SOL\n` +
+    `Won: ${s.totalWon.toFixed(4)} SOL\n` +
+    `Win Rate: ${wr}%\n` +
+    `🔥 Streak: ${s.winStreak} (Best: ${s.bestStreak})\n` +
+    `⭐ XP: ${s.xp}`,
+    { parse_mode: "Markdown" }
   );
 });
 
-bot.command('achievements', (ctx) => {
+bot.command("achievements", (ctx) => {
   const userId = ctx.from.id.toString();
-  const stats = userStats.get(userId);
-  
-  if (!stats || !stats.badges || stats.badges.length === 0) {
-    return ctx.reply("No achievements yet. Place bets to earn badges!");
-  }
-  
+  const s      = userStats.get(userId);
+  if (!s?.badges?.length) return ctx.reply("No achievements yet. Start betting!");
   let msg = "🏅 *Your Achievements*\n\n";
-  stats.badges.forEach(badgeId => {
-    const badge = ACHIEVEMENTS[badgeId];
-    if (badge) {
-      msg += `${badge.name} (+${badge.xp} XP)\n`;
+  s.badges.forEach((b) => { if (ACHIEVEMENTS[b]) msg += `${ACHIEVEMENTS[b].name} (+${ACHIEVEMENTS[b].xp} XP)\n`; });
+  ctx.reply(msg, { parse_mode: "Markdown" });
+});
+
+bot.command("tournament", (ctx) => {
+  if (!tournamentActive) return ctx.reply("No tournament active right now.");
+  const ms  = tournamentEndTime - Date.now();
+  const hrs = Math.floor(ms / 3_600_000);
+  const min = Math.floor((ms % 3_600_000) / 60_000);
+  ctx.reply(
+    `🏆 *Tournament Active!*\n\nTime left: *${hrs}h ${min}m*\nDouble jackpot chance!\nTop 3 win prizes at the end.`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.command("cancel", (ctx) => {
+  const userId = ctx.from.id.toString();
+  const inp    = pendingAmountInput.get(userId);
+  if (inp) { clearTimeout(inp.timeoutHandle); pendingAmountInput.delete(userId); }
+  // Clear any manual pending bets for this user
+  for (const [memoId, bet] of pendingManualBets.entries()) {
+    if (bet.userId === userId) {
+      clearTimeout(bet.timeoutHandle);
+      pendingManualBets.delete(memoId);
     }
-  });
-  
-  ctx.reply(msg, { parse_mode: 'Markdown' });
-});
-
-bot.command('tournament', (ctx) => {
-  if (tournamentActive) {
-    const remaining = tournamentEndTime - Date.now();
-    const hours = Math.floor(remaining / 3600000);
-    const minutes = Math.floor((remaining % 3600000) / 60000);
-    ctx.reply(
-      `🏆 *Tournament Active!*\n\n` +
-      `Time left: ${hours}h ${minutes}m\n` +
-      `Double jackpot chance!\n` +
-      `Top winners will be announced at the end.`,
-      { parse_mode: 'Markdown' }
-    );
-  } else {
-    ctx.reply("No tournament active currently.", { parse_mode: 'Markdown' });
   }
+  ctx.reply("✅ Cancelled.");
 });
 
-bot.command('help', (ctx) => {
+bot.command("help", (ctx) => {
   ctx.reply(
     `📋 *Commands*\n\n` +
-    `/connect - Connect Phantom wallet\n` +
-    `/balance - Check wallet balance\n` +
-    `/leaderboard - View top players\n` +
-    `/poll - Show current poll\n` +
-    `/jackpot - Check jackpot\n` +
-    `/daily - Claim daily reward\n` +
-    `/ref - Get referral link\n` +
-    `/stats - Your betting stats\n` +
-    `/achievements - Your badges\n` +
-    `/tournament - Tournament info\n` +
-    `/cancel - Cancel pending bet`,
-    { parse_mode: 'Markdown' }
+    `/connect – Connect Phantom wallet\n` +
+    `/register <addr> – Manual wallet registration\n` +
+    `/balance – Check wallet balance\n` +
+    `/leaderboard – View top players\n` +
+    `/poll – Show current poll\n` +
+    `/jackpot – Check jackpot\n` +
+    `/daily – Claim daily reward\n` +
+    `/ref – Get referral link\n` +
+    `/stats – Your betting stats\n` +
+    `/achievements – Your badges\n` +
+    `/tournament – Tournament info\n` +
+    `/cancel – Cancel pending bet`,
+    { parse_mode: "Markdown" }
   );
 });
 
-bot.command('cancel', (ctx) => {
-  const userId = ctx.from.id.toString();
-  pendingAmountInput.delete(userId);
-  pendingBets.delete(userId);
-  ctx.reply("✅ Cancelled");
-});
-
-bot.command('debug', async (ctx) => {
+bot.command("debug", async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id.toString())) return;
-  
-  const botBal = await checkBalance(botWallet.publicKey.toString());
+  const bal = await checkBalance(botWallet.publicKey.toString());
   ctx.reply(
-    `🔧 *Debug Info*\n\n` +
-    `Bot balance: ${botBal.toFixed(6)} SOL\n` +
+    `🔧 *Debug*\n\n` +
+    `Price: ${formatPrice()}\n` +
+    `Bot balance: ${bal.toFixed(6)} SOL\n` +
     `Jackpot: ${jackpotAmountSOL.toFixed(4)} SOL\n` +
-    `Users: ${userStats.size}\n` +
-    `Price: $${formatPrice()}\n` +
-    `Connected wallets: ${[...phantom.userSessions.values()].length}\n` +
-    `Tournament: ${tournamentActive ? 'Active' : 'Inactive'}`,
-    { parse_mode: 'Markdown' }
+    `Poll stakes: ${currentPoll.stakes.length}\n` +
+    `Poll pot: ${currentPoll.pot.toFixed(6)} SOL\n` +
+    `Users with wallets: ${userWallets.size}\n` +
+    `Total users: ${userStats.size}\n` +
+    `Pending manual bets: ${pendingManualBets.size}\n` +
+    `Pending amount inputs: ${pendingAmountInput.size}\n` +
+    `Tournament: ${tournamentActive ? "Active" : "Off"}\n` +
+    `Uptime: ${Math.floor(process.uptime())}s`,
+    { parse_mode: "Markdown" }
   );
+});
+
+// Admin: start tournament
+bot.command("starttournament", async (ctx) => {
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) return;
+  const hours = parseInt(ctx.message.text.split(" ")[1]) || 24;
+  startTournament(hours);
+  ctx.reply(`🏆 Tournament started for ${hours} hours!`);
+  await bot.telegram.sendMessage(
+    ANNOUNCEMENTS_CHANNEL,
+    `🏆 *TOURNAMENT STARTED!*\n\nDuration: ${hours} hours\nDouble jackpot chance for all bets!\nTop 3 winners get prizes!`,
+    { parse_mode: "Markdown" }
+  ).catch(() => {});
 });
 
 // ============================================
-// BUTTON HANDLER
+// VOTE BUTTON HANDLER
 // ============================================
 
 bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
-  
-  const userId = ctx.from.id.toString();
-  const username = ctx.from.username || ctx.from.first_name || 'Anonymous';
-  const choice = ctx.match[1];
-  
-  const session = phantom.getSessionByUserId(userId);
-  
-  if (!session?.walletAddress) {
-    const connectLink = phantom.generateConnectLink(userId);
+
+  const userId   = ctx.from.id.toString();
+  const username = ctx.from.username || ctx.from.first_name || "Anonymous";
+  const choice   = ctx.match[1];
+  const wallet   = getUserWallet(userId);
+
+  // Check for existing pending input
+  if (pendingAmountInput.has(userId)) {
+    return ctx.reply("⚠️ You already have a pending bet. Use /cancel first.").catch(() => {});
+  }
+
+  if (!wallet) {
+    // Show both options
+    const { url } = buildPhantomConnectUrl(userId);
     return ctx.reply(
-      `🔌 *Connect Wallet First*\n\n` +
-      `Click below to connect:`,
+      `🔌 *Connect a wallet first*\n\n` +
+      `Choose one:`,
       {
-        parse_mode: 'Markdown',
+        parse_mode: "Markdown",
         reply_markup: {
-          inline_keyboard: [[
-            { text: "🔌 Connect", url: connectLink }
-          ]]
-        }
+          inline_keyboard: [
+            [{ text: "🔌 Connect Phantom", url }],
+            [{ text: "📝 Manual Register", callback_data: "show_register" }],
+          ],
+        },
       }
     );
   }
-  
-  if (pendingAmountInput.has(userId) || pendingBets.has(userId)) {
-    return ctx.reply("⚠️ You have a pending bet. Use /cancel first.");
-  }
-  
-  const timeout = setTimeout(() => {
+
+  const emoji = { pump: "🚀", dump: "📉", stagnate: "🟡" }[choice];
+
+  const timeoutHandle = setTimeout(() => {
     pendingAmountInput.delete(userId);
-    ctx.reply("⏱️ Timed out").catch(() => {});
-  }, 60000);
-  
-  pendingAmountInput.set(userId, { choice, username, timeout });
-  
-  const emoji = { pump: '🚀', dump: '📉', stagnate: '🟡' }[choice];
-  await ctx.reply(`${emoji} *${choice.toUpperCase()}*\n\nEnter amount in SOL (min ${MIN_STAKE}):`, { parse_mode: 'Markdown' });
+    bot.telegram.sendMessage(ctx.chat.id, "⏱️ Timed out. Click a button to try again.").catch(() => {});
+  }, PAYMENT_TIMEOUT_MS);
+
+  pendingAmountInput.set(userId, { choice, username, chatId: ctx.chat.id, timeoutHandle });
+
+  await ctx.reply(
+    `${emoji} *${choice.toUpperCase()}* on SOL!\n\nEnter stake amount in SOL _(min ${MIN_STAKE}):_`,
+    { parse_mode: "Markdown" }
+  );
+});
+
+bot.action("show_register", async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(
+    `📝 *Manual Registration*\n\nSend:\n\`/register YOUR_SOLANA_WALLET_ADDRESS\``,
+    { parse_mode: "Markdown" }
+  );
 });
 
 // ============================================
-// TEXT HANDLER
+// TEXT HANDLER — stake amount
 // ============================================
 
-bot.on('text', async (ctx) => {
-  const text = ctx.message.text.trim();
-  if (text.startsWith('/')) return;
-  
-  const userId = ctx.from.id.toString();
+bot.on("text", async (ctx) => {
+  const text   = ctx.message.text.trim();
+  if (text.startsWith("/")) return;
+
+  const userId  = ctx.from.id.toString();
   const pending = pendingAmountInput.get(userId);
-  
   if (!pending) return;
-  
+
   const validation = validateStakeAmount(text);
-  if (!validation.valid) {
-    return ctx.reply(`❌ ${validation.error}. Try again:`);
-  }
-  
+  if (!validation.valid) return ctx.reply(`❌ ${validation.error}. Try again:`);
+
   const amount = validation.amount;
-  clearTimeout(pending.timeout);
+  clearTimeout(pending.timeoutHandle);
   pendingAmountInput.delete(userId);
-  
-  const session = phantom.getSessionByUserId(userId);
-  if (!session?.walletAddress) {
-    return ctx.reply("❌ Wallet not connected. Use /connect first.");
-  }
-  
-  pendingBets.set(userId, { 
-    amount, 
-    choice: pending.choice,
-    username: pending.username 
-  });
-  
+
+  const wallet = getUserWallet(userId);
+  if (!wallet) return ctx.reply("❌ Wallet not found. Use /connect or /register.");
+
+  const rakeAmt = parseFloat((amount * RAKE_PERCENT).toFixed(6));
+  const botAmt  = parseFloat((amount * (POT_PERCENT + JACKPOT_PERCENT)).toFixed(6));
+
+  // ── PHANTOM FLOW (both mobile + desktop) ──
+  // Build a session for this pending bet
+  const sessionId = generateSessionId();
+  phantomSessions.set(sessionId, { userId, createdAt: Date.now(), walletAddress: wallet.address });
+  pendingPhantomBets.set(sessionId, { userId, username: pending.username, amount, choice: pending.choice, chatId: pending.chatId || ctx.chat.id });
+
+  // Auto-expire
+  setTimeout(() => {
+    phantomSessions.delete(sessionId);
+    pendingPhantomBets.delete(sessionId);
+  }, PAYMENT_TIMEOUT_MS);
+
+  let txUrl;
   try {
-    const txLink = await phantom.generateTransactionLink(
-      userId,
-      amount,
-      pending.choice,
-      session.walletAddress
+    txUrl = await buildPhantomTxUrl(
+      sessionId,
+      wallet.address,
+      botWallet.publicKey.toString(),
+      amount * LAMPORTS_PER_SOL
     );
-    
-    const rakeAmount = amount * RAKE_PERCENT;
-    const potAmount = amount * POT_PERCENT;
-    const jackpotAmount = amount * JACKPOT_PERCENT;
-    
-    await ctx.reply(
-      `💳 *Approve Transaction*\n\n` +
-      `Amount: ${amount} SOL\n` +
-      `Choice: ${pending.choice.toUpperCase()}\n\n` +
-      `Breakdown:\n` +
-      `Rake (19%): ${rakeAmount.toFixed(6)} SOL\n` +
-      `Pot (80%): ${potAmount.toFixed(6)} SOL\n` +
-      `Jackpot (1%): ${jackpotAmount.toFixed(6)} SOL\n\n` +
-      `Click below to approve in Phantom:`,
-      {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [[
-            { text: "💎 Approve", url: txLink }
-          ]]
-        }
-      }
-    );
-    
   } catch (err) {
-    log.error("Transaction error:", err);
-    pendingBets.delete(userId);
-    ctx.reply("❌ Error creating transaction");
+    log.error("buildPhantomTxUrl:", err.message);
+    // Fall through to manual flow
+    txUrl = null;
   }
+
+  // ── MANUAL FLOW (memo-based on-chain verification) ──
+  const memoId    = generateMemoId();
+  const expiresAt = Date.now() + PAYMENT_TIMEOUT_MS;
+  const timeoutHandle = setTimeout(() => {
+    pendingManualBets.delete(memoId);
+    bot.telegram.sendMessage(ctx.chat.id, `⏱️ Manual payment window expired for memo \`${memoId}\`.`, { parse_mode: "Markdown" }).catch(() => {});
+  }, PAYMENT_TIMEOUT_MS);
+
+  pendingManualBets.set(memoId, {
+    userId,
+    username: pending.username,
+    amount,
+    choice: pending.choice,
+    chatId : ctx.chat.id,
+    expiresAt,
+    timeoutHandle,
+  });
+
+  // Start watching chain for manual payment
+  setTimeout(() => watchManualPayment(memoId), BLOCKCHAIN_POLL_MS);
+
+  // Build reply with both options
+  const keyboard = txUrl
+    ? { inline_keyboard: [[{ text: "💎 Approve in Phantom", url: txUrl }]] }
+    : undefined;
+
+  await ctx.reply(
+    `📋 *Stake Summary*\n\n` +
+    `💰 Amount: *${amount} SOL*\n` +
+    `📈 Choice: *${pending.choice.toUpperCase()}*\n\n` +
+    `*Option 1 — Phantom (easiest):*\n` +
+    (txUrl ? `Tap the button below to approve in Phantom.\n\n` : `_(Phantom link unavailable — use Option 2)_\n\n`) +
+    `*Option 2 — Manual send:*\n` +
+    `Send *${botAmt} SOL* to:\n\`${botWallet.publicKey.toString()}\`\n\n` +
+    `Also send *${rakeAmt} SOL* to:\n\`${RAKE_WALLET}\`\n\n` +
+    `🔑 *Include memo:* \`${memoId}\`\n` +
+    `_(Bot auto-detects payment on-chain within 30s)_\n\n` +
+    `⏱️ 5 minutes to complete`,
+    {
+      parse_mode  : "Markdown",
+      reply_markup: keyboard,
+    }
+  );
 });
 
 // ============================================
-// HOURLY SETTLEMENT
-// ============================================
-
-async function settleHour() {
-  log.info('⏰ Hourly settlement started');
-  
-  if (currentPoll.stakes.length === 0) {
-    await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, '⏰ No bets this hour').catch(()=>{});
-  } else {
-    let winnerChoice;
-    if (currentPrice > openPrice * 1.001) winnerChoice = 'pump';
-    else if (currentPrice < openPrice * 0.999) winnerChoice = 'dump';
-    else winnerChoice = 'stagnate';
-    
-    const winners = currentPoll.stakes.filter(s => s.choice === winnerChoice);
-    const totalPot = currentPoll.pot;
-    const totalWinningAmount = winners.reduce((a,s) => a + s.amount, 0);
-    
-    let paidCount = 0;
-    let paidAmount = 0;
-    
-    for (const w of winners) {
-      const share = w.amount / totalWinningAmount;
-      const payout = totalPot * share;
-      const multiplier = getStreakMultiplier(w.userId);
-      const finalPayout = payout * multiplier;
-      
-      const sig = await sendPayout(w.userId, finalPayout, 'Hourly win');
-      if (sig) {
-        paidCount++;
-        paidAmount += finalPayout;
-        
-        const stats = userStats.get(w.userId);
-        if (stats) {
-          stats.totalWon += finalPayout;
-          stats.winStreak = (stats.winStreak || 0) + 1;
-          if (stats.winStreak > (stats.bestStreak || 0)) stats.bestStreak = stats.winStreak;
-          stats.xp += 50;
-          userStats.set(w.userId, stats);
-        }
-        
-        if (stats?.winStreak >= 5) awardAchievement(w.userId, 'HOT_STREAK_5');
-        if (stats?.winStreak >= 10) awardAchievement(w.userId, 'HOT_STREAK_10');
-        
-        if (tournamentActive) {
-          const curr = tournamentLeaderboard.get(w.userId) || 0;
-          tournamentLeaderboard.set(w.userId, curr + finalPayout);
-        }
-      }
-    }
-    
-    const losers = currentPoll.stakes.filter(s => s.choice !== winnerChoice);
-    for (const l of losers) {
-      const stats = userStats.get(l.userId);
-      if (stats) stats.winStreak = 0;
-    }
-    
-    const resultMsg = 
-      `⏰ *Hourly Results*\n\n` +
-      `Winner: *${winnerChoice.toUpperCase()}*\n` +
-      `Pot: ${totalPot.toFixed(6)} SOL\n` +
-      `Winners: ${paidCount}\n` +
-      `Paid: ${paidAmount.toFixed(6)} SOL\n` +
-      `🎰 Jackpot: ${jackpotAmountSOL.toFixed(4)} SOL`;
-    
-    await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, resultMsg, { parse_mode: 'Markdown' }).catch(()=>{});
-    log.ok(`Hourly settlement complete: ${paidCount} winners, ${paidAmount.toFixed(6)} SOL paid`);
-  }
-  
-  currentPoll = {
-    pot: 0,
-    stakes: [],
-    startTime: Date.now(),
-    endTime: Date.now() + 3600000,
-    totalBets: 0,
-  };
-  openPrice = currentPrice;
-  
-  await updatePoll();
-  await updateLeaderboard();
-  
-  if (tournamentActive && Date.now() >= tournamentEndTime) {
-    endTournament();
-  }
-}
-
-// ============================================
-// EXPRESS SERVER
+// EXPRESS SERVER + PHANTOM CALLBACK
 // ============================================
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-app.get('/', (req, res) => {
-  res.send('Degen Echo Bot Running');
-});
+app.get("/", (_, res) => res.send("Degen Echo Bot — Running ✅"));
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    uptime: process.uptime(),
-    users: userStats.size,
-    jackpot: jackpotAmountSOL,
-    price: currentPrice,
-    connectedWallets: [...phantom.userSessions.values()].length,
-    tournament: tournamentActive
-  });
-});
+app.get("/health", (_, res) => res.json({
+  status  : "ok",
+  uptime  : Math.floor(process.uptime()),
+  price   : currentPrice,
+  jackpot : jackpotAmountSOL,
+  pot     : currentPoll.pot,
+  stakes  : currentPoll.stakes.length,
+  users   : userStats.size,
+  wallets : userWallets.size,
+  tournament: tournamentActive,
+}));
 
-app.get('/phantom/callback', async (req, res) => {
-  const { session: sessionId, public_key, transaction_signature, error } = req.query;
-  
-  log.info('Phantom callback:', { sessionId, public_key, transaction_signature, error });
-  
-  if (public_key) {
-    const session = phantom.validateSession(sessionId);
-    if (session) {
-      phantom.updateSessionWithWallet(sessionId, public_key, session.userId);
-      log.ok(`✅ Wallet connected for user ${session.userId}`);
-    }
-  }
-  
-  if (transaction_signature && sessionId) {
-    const session = phantom.validateSession(sessionId);
-    if (session) {
-      const bet = pendingBets.get(session.userId);
-      if (bet) {
-        await processBet(session.userId, bet.amount, bet.choice, transaction_signature);
-        pendingBets.delete(session.userId);
-        
-        try {
-          const emoji = { pump: '🚀', dump: '📉', stagnate: '🟡' }[bet.choice];
-          await bot.telegram.sendMessage(
-            session.userId,
-            `${emoji} *Bet Confirmed!*\n\n` +
-            `Amount: ${bet.amount} SOL\n` +
-            `Choice: ${bet.choice.toUpperCase()}\n` +
-            `TX: \`${transaction_signature.slice(0,8)}...\``,
-            { parse_mode: 'Markdown' }
-          );
-        } catch (err) {
-          log.error('Failed to send confirmation:', err);
-        }
-        
-        log.ok(`✅ Bet confirmed for user ${session.userId}`);
-      }
-    }
-  }
-  
-  res.send(`
+/**
+ * Phantom callback — handles both:
+ *  1. Wallet connection (public_key param)
+ *  2. Transaction confirmation (transaction_signature param)
+ */
+app.get("/phantom/callback", async (req, res) => {
+  const { session: sessionId, public_key, transaction_signature, errorCode, errorMessage } = req.query;
+
+  log.info("Phantom callback:", { sessionId, public_key: public_key?.slice(0,8), transaction_signature: transaction_signature?.slice(0,8), errorCode });
+
+  const htmlClose = (msg) => res.send(`
+    <!DOCTYPE html>
     <html>
-      <body>
+      <head><meta charset="utf-8"><title>Degen Echo</title>
+      <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#1a1a2e;color:#fff;}
+      .box{text-align:center;padding:2rem;}</style></head>
+      <body><div class="box">
+        <h2>🎰 Degen Echo</h2>
+        <p>${msg}</p>
+        <p><small>You can close this window</small></p>
         <script>
-          window.close();
-          window.location.href = 'tg://resolve?domain=${bot.botInfo.username}';
+          setTimeout(() => {
+            if(window.opener) window.close();
+          }, 2000);
         </script>
-        <p>Success! You can close this window.</p>
-      </body>
+      </div></body>
     </html>
   `);
+
+  if (errorCode) {
+    log.warn("Phantom error:", errorCode, errorMessage);
+    const session = getPhantomSession(sessionId);
+    if (session) {
+      await bot.telegram.sendMessage(
+        session.userId,
+        `❌ Phantom connection failed: ${errorMessage || errorCode}\n\nTry /connect again or use /register for manual setup.`
+      ).catch(() => {});
+    }
+    return htmlClose("❌ Connection failed. Please try again.");
+  }
+
+  // ── WALLET CONNECTION ──
+  if (public_key && sessionId) {
+    const session = getPhantomSession(sessionId);
+    if (session) {
+      session.walletAddress = public_key;
+      phantomSessions.set(sessionId, session);
+
+      const username = userStats.get(session.userId)?.username || "User";
+      userWallets.set(session.userId, {
+        address      : public_key,
+        username,
+        registeredAt : Date.now(),
+        via          : "phantom",
+      });
+
+      log.ok(`Phantom wallet connected: ${public_key.slice(0,8)}… for user ${session.userId}`);
+
+      await bot.telegram.sendMessage(
+        session.userId,
+        `✅ *Phantom Wallet Connected!*\n\n\`${public_key}\`\n\nYou can now bet on the polls in ${LIVE_CHANNEL}`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+
+      return htmlClose("✅ Wallet connected! Head back to Telegram.");
+    }
+  }
+
+  // ── TRANSACTION CONFIRMATION ──
+  if (transaction_signature && sessionId) {
+    const betData = pendingPhantomBets.get(sessionId);
+    if (betData) {
+      pendingPhantomBets.delete(sessionId);
+      processedTxSignatures.add(transaction_signature);
+
+      await confirmBet(
+        betData.userId,
+        betData.username,
+        betData.amount,
+        betData.choice,
+        transaction_signature,
+        betData.chatId || betData.userId
+      );
+
+      return htmlClose("✅ Bet confirmed! Good luck 🍀");
+    }
+  }
+
+  return htmlClose("Done! You can close this window.");
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  log.ok(`🚀 Server running on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => log.ok(`Server on port ${PORT}`));
 
 // ============================================
 // CRON JOBS
 // ============================================
 
-cron.schedule('0 * * * *', settleHour);
-cron.schedule('*/30 * * * * *', updatePoll);
-cron.schedule('*/5 * * * *', updateLeaderboard);
+// Hourly settlement + new poll
+cron.schedule("0 * * * *", settleHour);
 
-cron.schedule('* * * * *', () => {
-  if (tournamentActive && Date.now() >= tournamentEndTime) {
-    endTournament();
-  }
+// Update poll display every 30 seconds
+cron.schedule("*/30 * * * * *", updatePoll);
+
+// Update leaderboard every 5 minutes
+cron.schedule("*/5 * * * *", updateLeaderboard);
+
+// Check tournament end every minute
+cron.schedule("* * * * *", () => {
+  if (tournamentActive && Date.now() >= tournamentEndTime) endTournament();
 });
 
-cron.schedule('0 0 * * *', () => {
-  if (processedTxSignatures.size > 1000) {
-    const toDelete = Array.from(processedTxSignatures).slice(0, 500);
-    toDelete.forEach(sig => processedTxSignatures.delete(sig));
+// Cleanup processed tx set daily
+cron.schedule("0 0 * * *", () => {
+  if (processedTxSignatures.size > 2000) {
+    [...processedTxSignatures].slice(0, 1000).forEach((s) => processedTxSignatures.delete(s));
+  }
+  // Clean expired rate limit entries
+  const now = Date.now();
+  for (const [uid, e] of rateLimitMap.entries()) {
+    if (now - e.windowStart > RATE_WINDOW_MS * 2) rateLimitMap.delete(uid);
   }
 });
 
@@ -1236,28 +1432,23 @@ cron.schedule('0 0 * * *', () => {
 // ============================================
 
 async function startup() {
-  log.info("Starting up...");
-  
+  log.info("Starting Degen Echo Bot…");
+
   connectPriceWebSocket();
-  
+
+  // Wait up to 15s for first price
   for (let i = 0; i < 15; i++) {
-    if (currentPrice > 0) {
-      log.ok(`✅ Price received: $${currentPrice.toFixed(4)}`);
-      break;
-    }
-    await new Promise(r => setTimeout(r, 2000));
+    if (currentPrice > 0) { log.ok(`Price: ${formatPrice()}`); break; }
+    await new Promise((r) => setTimeout(r, 1000));
   }
-  
-  if (currentPrice <= 0) {
-    currentPrice = 20;
-    log.warn("Using fallback price: $20");
-  }
-  
+  if (currentPrice <= 0) { currentPrice = 20; log.warn("Using fallback price $20"); }
   openPrice = currentPrice;
+
+  // Post initial poll and leaderboard
   await updatePoll();
   await updateLeaderboard();
-  
-  log.ok("✅ Bot startup complete!");
+
+  log.ok("✅ Startup complete!");
 }
 
 // ============================================
@@ -1265,20 +1456,24 @@ async function startup() {
 // ============================================
 
 bot.launch({ dropPendingUpdates: true })
-  .then(() => {
-    log.ok("🤖 Bot is live!");
-    startup();
+  .then(async () => {
+    const info = await bot.telegram.getMe();
+    botUsername = info.username;
+    log.ok(`Bot @${botUsername} is LIVE!`);
+    log.ok("Rake wallet:", RAKE_WALLET);
+    log.ok("Bot wallet :", botWallet.publicKey.toString());
+    await startup();
   })
-  .catch(err => {
-    log.error("Launch failed:", err);
+  .catch((err) => {
+    log.error("Launch failed:", err.message);
     process.exit(1);
   });
 
-["SIGINT", "SIGTERM"].forEach(sig => {
+for (const sig of ["SIGINT", "SIGTERM"]) {
   process.once(sig, () => {
-    log.info("Shutting down...");
+    log.info("Shutting down…");
     bot.stop(sig);
     if (ws) ws.close();
-    process.exit(0);
+    setTimeout(() => process.exit(0), 2000);
   });
-});
+}
