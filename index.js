@@ -13,7 +13,7 @@
  *  8. watchManualPayment — fixed recursive setTimeout leak on re-entry
  *  9. Daily reward payout failure — notifies user if wallet missing
  * 10. General: all unhandled promise rejections caught at process level
- * 11. Added /envtest command to diagnose channel/group access
+ * 11. Added /envtest command to diagnose channel/group access (now replies even if not admin)
  */
 
 require("dotenv").config();
@@ -1255,10 +1255,12 @@ bot.command("debug", async (ctx) => {
   );
 });
 
-// 🔧 DIAGNOSTIC COMMAND – added for channel troubleshooting
+// 🔧 DIAGNOSTIC COMMAND – now replies even if not admin
 bot.command('envtest', async (ctx) => {
-  // Only allow admins
-  if (!ADMIN_IDS.includes(ctx.from.id.toString())) return;
+  // If not admin, still reply with a message (but don't run tests)
+  if (!ADMIN_IDS.includes(ctx.from.id.toString())) {
+    return ctx.reply('❌ You are not authorized to use this command. (Admin only)');
+  }
 
   const live = process.env.LIVE_CHANNEL || LIVE_CHANNEL;
   const community = process.env.COMMUNITY_GROUP || COMMUNITY_GROUP;
