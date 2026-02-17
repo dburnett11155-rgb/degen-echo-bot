@@ -1,37 +1,18 @@
 services:
   - type: web
     name: degen-echo-bot
-    runtime: node
-    repo: https://github.com/YOUR_USERNAME/YOUR_REPO_NAME
-    plan: free
-    region: oregon
+    env: node
     buildCommand: npm install
-    startCommand: npm start
-    healthCheckPath: /health
+    startCommand: node degen-echo-fixed.js
     envVars:
-      - key: NODE_VERSION
-        value: 18.17.0
       - key: NODE_ENV
         value: production
-      - key: BOT_TOKEN
-        sync: false
-      - key: BOT_PRIVATE_KEY
-        sync: false
-      - key: RAKE_WALLET
-        sync: false
-      - key: ADMIN_TELEGRAM_ID
-        sync: false
-      - key: APP_URL
-        sync: false
-      - key: SESSION_SECRET
-        sync: false
-      - key: LIVE_CHANNEL
-        value: @degenecholive
-      - key: ANNOUNCEMENTS_CHANNEL
-        value: @degenechochamber
-      - key: COMMUNITY_GROUP
-        value: @degenechochat
-      - key: SOLANA_RPC
-        value: https://api.mainnet-beta.solana.com
-      - key: DEBUG
-        value: false
+    disk:
+      name: bot-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+```
+
+Then in your `.env` or Render environment variables, add:
+```
+DATA_DIR=/opt/render/project/src/data
