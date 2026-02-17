@@ -2,10 +2,17 @@
 
 /**
  * DEGEN ECHO – PRODUCTION BOT
- * Fixed: Kraken price feed, Phantom wallet (mobile + desktop),
- *        manual /register fallback, auto polls, leaderboard,
- *        hourly settlement, jackpot, achievements, daily rewards,
- *        referrals, tournaments, on-chain verification
+ * Fixes applied:
+ *  1. Persistence layer (JSON file-based) — survives restarts
+ *  2. checkOnChainPayment — increased signature scan limit + timestamp guard
+ *  3. processedTxSignatures — capped at 5000, cleaned on insert (not just midnight)
+ *  4. sendPayout — retry logic (3 attempts) with exponential backoff
+ *  5. settleHour — race condition guard (idempotent lock)
+ *  6. Rate limiter — per-action cooldown on vote buttons to prevent spam
+ *  7. Phantom callback — validates public_key is a real Solana address
+ *  8. watchManualPayment — fixed recursive setTimeout leak on re-entry
+ *  9. Daily reward payout failure — notifies user if wallet missing
+ * 10. General: all unhandled promise rejections caught at process level
  */
 
 require("dotenv").config();
@@ -20,10 +27,12 @@ const {
   SystemProgram,
 } = require("@solana/web3.js");
 const WebSocket = require("ws");
-const express = require("express");
-const cron = require("node-cron");
-const bs58 = require("bs58");
-const crypto = require("crypto");
+const express   = require("express");
+const cron      = require("node-cron");
+const bs58      = require("bs58");
+const crypto    = require("crypto");
+const fs        = require("fs");
+const path      = require("path");
 
 // ============================================
 // CONFIGURATION
@@ -43,26 +52,102 @@ for (const key of REQUIRED_ENV) {
   }
 }
 
-const BOT_TOKEN          = process.env.BOT_TOKEN;
-const BOT_PRIVATE_KEY    = process.env.BOT_PRIVATE_KEY;
-const RAKE_WALLET        = process.env.RAKE_WALLET;
-const ADMIN_IDS          = [process.env.ADMIN_TELEGRAM_ID, "1087968824"].filter(Boolean);
-const APP_URL            = process.env.APP_URL.replace(/\/$/, "");
+const BOT_TOKEN       = process.env.BOT_TOKEN;
+const BOT_PRIVATE_KEY = process.env.BOT_PRIVATE_KEY;
+const RAKE_WALLET     = process.env.RAKE_WALLET;
+const ADMIN_IDS       = [process.env.ADMIN_TELEGRAM_ID, "1087968824"].filter(Boolean);
+const APP_URL         = process.env.APP_URL.replace(/\/$/, "");
 
 const RAKE_PERCENT    = 0.19;
 const POT_PERCENT     = 0.80;
 const JACKPOT_PERCENT = 0.01;
 
-const MIN_STAKE           = 0.001;
-const MAX_STAKE           = 1000;
-const PAYMENT_TIMEOUT_MS  = 5 * 60 * 1000;   // 5 min to send SOL
-const BLOCKCHAIN_POLL_MS  = 6000;             // check chain every 6s
-const PORT                = Number(process.env.PORT) || 3000;
+const MIN_STAKE          = 0.001;
+const MAX_STAKE          = 1000;
+const PAYMENT_TIMEOUT_MS = 5 * 60 * 1000;  // 5 min
+const BLOCKCHAIN_POLL_MS = 6000;            // 6 s
+const PORT               = Number(process.env.PORT) || 3000;
 
-const LIVE_CHANNEL         = process.env.LIVE_CHANNEL         || "@degenecholive";
-const ANNOUNCEMENTS_CHANNEL= process.env.ANNOUNCEMENTS_CHANNEL|| "@degenechochamber";
-const COMMUNITY_GROUP      = process.env.COMMUNITY_GROUP      || "@degenechochat";
-const SOLANA_RPC           = process.env.SOLANA_RPC           || "https://api.mainnet-beta.solana.com";
+const LIVE_CHANNEL          = process.env.LIVE_CHANNEL          || "@degenecholive";
+const ANNOUNCEMENTS_CHANNEL = process.env.ANNOUNCEMENTS_CHANNEL || "@degenechochamber";
+const COMMUNITY_GROUP       = process.env.COMMUNITY_GROUP       || "@degenechochat";
+const SOLANA_RPC            = process.env.SOLANA_RPC            || "https://api.mainnet-beta.solana.com";
+
+// FIX 3: cap for in-memory processed signatures
+const MAX_PROCESSED_SIGS = 5000;
+const TRIM_PROCESSED_TO  = 3000;
+
+// ============================================
+// PERSISTENCE — FIX 1
+// ============================================
+
+const DATA_DIR  = process.env.DATA_DIR || path.join(__dirname, "data");
+const DATA_FILE = path.join(DATA_DIR, "state.json");
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function saveState() {
+  try {
+    ensureDataDir();
+    const state = {
+      userWallets   : Object.fromEntries(userWallets),
+      userStats     : Object.fromEntries(userStats),
+      userDailyStreak: Object.fromEntries(userDailyStreak),
+      referralCodes : Object.fromEntries(referralCodes),
+      userReferrals : Object.fromEntries(userReferrals),
+      jackpotAmountSOL,
+      jackpotHistory,
+      lastJackpotWin,
+      pollMessageId,
+      pollChatId,
+      leaderboardMessageId,
+      leaderboardChatId,
+      currentPoll,
+      openPrice,
+      tournamentActive,
+      tournamentEndTime,
+    };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    log.error("saveState failed:", err.message);
+  }
+}
+
+function loadState() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return;
+    const raw   = fs.readFileSync(DATA_FILE, "utf8");
+    const state = JSON.parse(raw);
+
+    if (state.userWallets)    Object.entries(state.userWallets).forEach(([k, v]) => userWallets.set(k, v));
+    if (state.userStats)      Object.entries(state.userStats).forEach(([k, v]) => userStats.set(k, v));
+    if (state.userDailyStreak)Object.entries(state.userDailyStreak).forEach(([k, v]) => userDailyStreak.set(k, v));
+    if (state.referralCodes)  Object.entries(state.referralCodes).forEach(([k, v]) => referralCodes.set(k, v));
+    if (state.userReferrals)  Object.entries(state.userReferrals).forEach(([k, v]) => userReferrals.set(k, v));
+
+    if (state.jackpotAmountSOL != null) jackpotAmountSOL     = state.jackpotAmountSOL;
+    if (state.jackpotHistory)           jackpotHistory        = state.jackpotHistory;
+    if (state.lastJackpotWin)           lastJackpotWin        = state.lastJackpotWin;
+    if (state.pollMessageId)            pollMessageId         = state.pollMessageId;
+    if (state.pollChatId)               pollChatId            = state.pollChatId;
+    if (state.leaderboardMessageId)     leaderboardMessageId  = state.leaderboardMessageId;
+    if (state.leaderboardChatId)        leaderboardChatId     = state.leaderboardChatId;
+    if (state.openPrice)                openPrice             = state.openPrice;
+    if (state.tournamentActive != null) tournamentActive      = state.tournamentActive;
+    if (state.tournamentEndTime)        tournamentEndTime     = state.tournamentEndTime;
+
+    // Restore current poll if it hasn't expired yet
+    if (state.currentPoll && state.currentPoll.endTime > Date.now()) {
+      currentPoll = state.currentPoll;
+    }
+
+    log.ok("State loaded from disk");
+  } catch (err) {
+    log.warn("loadState failed (starting fresh):", err.message);
+  }
+}
 
 // ============================================
 // SOLANA SETUP
@@ -114,75 +199,70 @@ let currentPoll = {
   totalBets: 0,
 };
 
-/**
- * userWallets: userId → { address, username, registeredAt, via }
- * via = "phantom" | "manual"
- */
-const userWallets    = new Map();
+const userWallets       = new Map();
+const phantomSessions   = new Map();
+const pendingPhantomBets= new Map();
 
-/**
- * phantomSessions: sessionId → { userId, createdAt, walletAddress? }
- * Used for the Phantom deep-link OAuth-style flow
- */
-const phantomSessions = new Map();
+const pendingAmountInput = new Map();
+const pendingManualBets  = new Map();
 
-/**
- * pendingPhantomBets: sessionId → { userId, amount, choice, username }
- * Stored while we wait for Phantom to redirect back with tx sig
- */
-const pendingPhantomBets = new Map();
-
-// Manual-flow pending state
-const pendingAmountInput = new Map(); // userId → { choice, username, timeoutHandle }
-const pendingManualBets  = new Map(); // userId → { amount, choice, username, memoId, expiresAt, timeoutHandle }
-
+// FIX 3: bounded set with inline trimming
 const processedTxSignatures = new Set();
+function addProcessedSig(sig) {
+  processedTxSignatures.add(sig);
+  if (processedTxSignatures.size > MAX_PROCESSED_SIGS) {
+    // drop oldest entries
+    const iter = processedTxSignatures.values();
+    let removed = 0;
+    const toRemove = MAX_PROCESSED_SIGS - TRIM_PROCESSED_TO;
+    while (removed < toRemove) { iter.next(); processedTxSignatures.delete(iter.next().value); removed++; }
+  }
+}
 
-// Stats / social
-const userStats        = new Map(); // userId → StatsObj
-const userDailyStreak  = new Map();
-const referralCodes    = new Map();
-const userReferrals    = new Map();
-const rateLimitMap     = new Map();
-const tournamentLB     = new Map();
+const userStats       = new Map();
+const userDailyStreak = new Map();
+const referralCodes   = new Map();
+const userReferrals   = new Map();
+const rateLimitMap    = new Map();
+const tournamentLB    = new Map();
 
-// Jackpot
+// FIX 6: per-action vote cooldown (prevents spam clicks)
+const voteActionCooldown = new Map(); // userId → lastVoteTs
+const VOTE_COOLDOWN_MS   = 3000;
+
 let jackpotAmountSOL = 0;
 let jackpotHistory   = [];
 let lastJackpotWin   = null;
 
-// Pinned message IDs
 let pollMessageId        = null;
 let pollChatId           = null;
 let leaderboardMessageId = null;
 let leaderboardChatId    = null;
 
-// Tournament
 let tournamentActive  = false;
 let tournamentEndTime = 0;
 
-// Bot username resolved after launch
+// FIX 5: settlement idempotency lock
+let settlementInProgress = false;
+
 let botUsername = "";
 
-const RATE_LIMIT    = 20;
-const RATE_WINDOW_MS= 60_000;
+const RATE_LIMIT     = 20;
+const RATE_WINDOW_MS = 60_000;
 
 const DAILY_REWARDS = [0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.015];
 
 const ACHIEVEMENTS = {
-  FIRST_BET   : { name: "🎯 First Bet",      xp: 10  },
-  HOT_STREAK_5: { name: "🔥 5 Win Streak",   xp: 50  },
-  HOT_STREAK_10:{ name: "⚡ 10 Win Streak",  xp: 200 },
-  WHALE       : { name: "🐋 Whale (10+ SOL)",xp: 500 },
-  JACKPOT     : { name: "🎰 Jackpot Winner", xp: 1000},
+  FIRST_BET   : { name: "🎯 First Bet",       xp: 10   },
+  HOT_STREAK_5: { name: "🔥 5 Win Streak",    xp: 50   },
+  HOT_STREAK_10:{ name: "⚡ 10 Win Streak",   xp: 200  },
+  WHALE       : { name: "🐋 Whale (10+ SOL)", xp: 500  },
+  JACKPOT     : { name: "🎰 Jackpot Winner",  xp: 1000 },
 };
 
 // ============================================
-// KRAKEN WEBSOCKET — FIXED
+// KRAKEN WEBSOCKET
 // ============================================
-// Root cause of original bug:
-//   msg[2] === "ticker" is WRONG — Kraken sends channelName at index 2
-//   but only for v1 format. Safe fix: check Array.isArray and msg[1].c
 
 let ws = null;
 let wsReconnectDelay = 2000;
@@ -206,7 +286,7 @@ function connectPriceWebSocket() {
     wsReconnectDelay = 2000;
     ws.send(JSON.stringify({
       event: "subscribe",
-      pair : ["XBT/USD", "SOL/USD"],   // SOL/USD is correct Kraken pair
+      pair : ["SOL/USD"],
       subscription: { name: "ticker" },
     }));
   });
@@ -214,23 +294,17 @@ function connectPriceWebSocket() {
   ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-
-      // Kraken ticker format: [channelId, tickerData, "ticker", "PAIR"]
       if (
         Array.isArray(msg) &&
         msg.length === 4 &&
         msg[2] === "ticker" &&
         msg[3] === "SOL/USD" &&
-        msg[1] &&
-        msg[1].c &&
-        msg[1].c[0]
+        msg[1]?.c?.[0]
       ) {
         const price = parseFloat(msg[1].c[0]);
-        if (!isNaN(price) && price > 0) {
-          currentPrice = price;
-        }
+        if (!isNaN(price) && price > 0) currentPrice = price;
       }
-    } catch (_) { /* ignore malformed */ }
+    } catch (_) {}
   });
 
   ws.on("error", (err) => log.error("WS error:", err.message));
@@ -244,18 +318,8 @@ function connectPriceWebSocket() {
 }
 
 // ============================================
-// PHANTOM WALLET — FIXED
+// PHANTOM WALLET
 // ============================================
-// The original code built Phantom Universal Links incorrectly.
-// Phantom deep links work differently on mobile vs desktop:
-//   - Mobile: phantom://  or  https://phantom.app/ul/v1/...
-//   - Desktop: the extension intercepts the page directly
-//
-// The correct approach:
-//   1. Generate a session ID
-//   2. Send user a Phantom connect URL that redirects to APP_URL/phantom/callback
-//   3. Callback receives public_key, stores it, notifies user via bot
-//   4. For transactions: build unsigned tx, serialize, send via Phantom sign URL
 
 function generateSessionId() {
   return crypto.randomBytes(16).toString("hex");
@@ -263,12 +327,7 @@ function generateSessionId() {
 
 function createPhantomSession(userId) {
   const sessionId = generateSessionId();
-  phantomSessions.set(sessionId, {
-    userId,
-    createdAt: Date.now(),
-    walletAddress: null,
-  });
-  // Auto-expire after 10 minutes
+  phantomSessions.set(sessionId, { userId, createdAt: Date.now(), walletAddress: null });
   setTimeout(() => phantomSessions.delete(sessionId), 10 * 60_000);
   return sessionId;
 }
@@ -276,58 +335,53 @@ function createPhantomSession(userId) {
 function getPhantomSession(sessionId) {
   const s = phantomSessions.get(sessionId);
   if (!s) return null;
-  if (Date.now() - s.createdAt > 10 * 60_000) {
-    phantomSessions.delete(sessionId);
-    return null;
-  }
+  if (Date.now() - s.createdAt > 10 * 60_000) { phantomSessions.delete(sessionId); return null; }
   return s;
 }
 
-/** Build Phantom connect URL for BOTH mobile and desktop */
 function buildPhantomConnectUrl(userId) {
-  const sessionId = createPhantomSession(userId);
-  const redirectUrl = `${APP_URL}/phantom/callback?session=${sessionId}`;
-
-  // Phantom Universal Link (works mobile + desktop extension)
-  const params = new URLSearchParams({
-    app_url    : APP_URL,
-    dapp_key   : "degen-echo",
-    redirect_link: redirectUrl,
-    cluster    : "mainnet-beta",
-  });
-
-  return {
-    sessionId,
-    url: `https://phantom.app/ul/v1/connect?${params.toString()}`,
-  };
-}
-
-/** Build Phantom signAndSendTransaction URL */
-async function buildPhantomTxUrl(sessionId, fromAddress, toAddress, lamports) {
-  const { blockhash, lastValidBlockHeight } =
-    await connection.getLatestBlockhash("confirmed");
-
-  const tx = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey: new PublicKey(fromAddress),
-      toPubkey  : new PublicKey(toAddress),
-      lamports  : Math.floor(lamports),
-    })
-  );
-  tx.recentBlockhash = blockhash;
-  tx.feePayer = new PublicKey(fromAddress);
-  // Do NOT sign — Phantom signs it
-  const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
-  const encodedTx  = bs58.encode(serialized);
-
+  const sessionId   = createPhantomSession(userId);
   const redirectUrl = `${APP_URL}/phantom/callback?session=${sessionId}`;
   const params = new URLSearchParams({
-    transaction  : encodedTx,
+    app_url      : APP_URL,
+    dapp_key     : "degen-echo",
     redirect_link: redirectUrl,
     cluster      : "mainnet-beta",
   });
+  return { sessionId, url: `https://phantom.app/ul/v1/connect?${params.toString()}` };
+}
 
-  return `https://phantom.app/ul/v1/signAndSendTransaction?${params.toString()}`;
+async function buildPhantomTxUrl(sessionId, fromAddress, toAddress, lamports) {
+  try {
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash("confirmed");
+
+    const tx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: new PublicKey(fromAddress),
+        toPubkey  : new PublicKey(toAddress),
+        lamports  : Math.floor(lamports),
+      })
+    );
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = new PublicKey(fromAddress);
+
+    const serialized = tx.serialize({ requireAllSignatures: false, verifySignatures: false });
+    const encodedTx  = bs58.encode(serialized);
+
+    const redirectUrl = `${APP_URL}/phantom/callback?session=${sessionId}`;
+    const params = new URLSearchParams({
+      transaction  : encodedTx,
+      dapp_key     : "degen-echo",
+      redirect_link: redirectUrl,
+      cluster      : "mainnet-beta",
+    });
+
+    return `https://phantom.app/ul/v1/signAndSendTransaction?${params.toString()}`;
+  } catch (err) {
+    log.error("buildPhantomTxUrl error:", err.message);
+    return null;
+  }
 }
 
 // ============================================
@@ -387,7 +441,7 @@ function ensureStats(userId, username) {
     });
   }
   const s = userStats.get(userId);
-  s.username = username; // keep fresh
+  s.username = username;
   return s;
 }
 
@@ -435,12 +489,12 @@ async function tryWinJackpot(userId, username) {
 // ============================================
 
 async function claimDailyReward(userId) {
-  const now  = Date.now();
+  const now   = Date.now();
   const entry = userDailyStreak.get(userId) || { streak: 0, lastClaim: 0 };
   const hrs   = (now - entry.lastClaim) / 3_600_000;
   if (hrs < 24) return { success: false, hoursLeft: 24 - hrs };
   if (hrs > 48) entry.streak = 0;
-  entry.streak = Math.min(entry.streak + 1, DAILY_REWARDS.length);
+  entry.streak    = Math.min(entry.streak + 1, DAILY_REWARDS.length);
   entry.lastClaim = now;
   userDailyStreak.set(userId, entry);
   return { success: true, reward: DAILY_REWARDS[entry.streak - 1], streak: entry.streak };
@@ -455,6 +509,7 @@ function startTournament(durationHours = 24) {
   tournamentEndTime = Date.now() + durationHours * 3_600_000;
   tournamentLB.clear();
   log.ok(`Tournament started — ${durationHours}h`);
+  saveState();
 }
 
 async function endTournament() {
@@ -471,83 +526,108 @@ async function endTournament() {
 
   await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, msg, { parse_mode: "Markdown" }).catch(() => {});
   tournamentLB.clear();
+  saveState();
 }
 
 // ============================================
-// PAYOUT
+// PAYOUT — FIX 4: retry with backoff
 // ============================================
 
-async function sendPayout(toAddress, amountSOL, description) {
+async function sendPayout(toAddress, amountSOL, description, retries = 3) {
   if (!botWallet || !connection) return null;
-  try {
-    const toPubkey   = new PublicKey(toAddress);
-    const fromPubkey = botWallet.publicKey;
 
-    const balLamports   = await connection.getBalance(fromPubkey);
-    const neededLamports= Math.ceil(amountSOL * LAMPORTS_PER_SOL) + 5000;
-    if (balLamports < neededLamports) {
-      const have = (balLamports / LAMPORTS_PER_SOL).toFixed(6);
-      for (const id of ADMIN_IDS) {
-        await bot.telegram.sendMessage(
-          id,
-          `⚠️ *Bot wallet low!*\nNeed: ${amountSOL.toFixed(6)} SOL\nHave: ${have} SOL\nFor: ${description}`,
-          { parse_mode: "Markdown" }
-        ).catch(() => {});
+  const toPubkey   = new PublicKey(toAddress);
+  const fromPubkey = botWallet.publicKey;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const balLamports    = await connection.getBalance(fromPubkey);
+      const neededLamports = Math.ceil(amountSOL * LAMPORTS_PER_SOL) + 5000;
+      if (balLamports < neededLamports) {
+        const have = (balLamports / LAMPORTS_PER_SOL).toFixed(6);
+        for (const id of ADMIN_IDS) {
+          await bot.telegram.sendMessage(
+            id,
+            `⚠️ *Bot wallet low!*\nNeed: ${amountSOL.toFixed(6)} SOL\nHave: ${have} SOL\nFor: ${description}`,
+            { parse_mode: "Markdown" }
+          ).catch(() => {});
+        }
+        return null; // insufficient funds — don't retry
       }
-      return null;
+
+      const { blockhash, lastValidBlockHeight } =
+        await connection.getLatestBlockhash("confirmed");
+
+      const tx = new Transaction().add(
+        SystemProgram.transfer({
+          fromPubkey,
+          toPubkey,
+          lamports: Math.floor(amountSOL * LAMPORTS_PER_SOL),
+        })
+      );
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = fromPubkey;
+      tx.sign(botWallet);
+
+      const sig = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight      : false,
+        preflightCommitment: "confirmed",
+      });
+      await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+
+      log.ok(`Paid ${amountSOL.toFixed(6)} SOL → ${toAddress} | ${description}`);
+      return sig;
+    } catch (err) {
+      log.error(`sendPayout attempt ${attempt}/${retries} failed:`, err.message);
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt)); // 1s, 2s backoff
+      }
     }
-
-    const { blockhash, lastValidBlockHeight } =
-      await connection.getLatestBlockhash("confirmed");
-
-    const tx = new Transaction().add(
-      SystemProgram.transfer({
-        fromPubkey,
-        toPubkey,
-        lamports: Math.floor(amountSOL * LAMPORTS_PER_SOL),
-      })
-    );
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = fromPubkey;
-    tx.sign(botWallet);
-
-    const sig = await connection.sendRawTransaction(tx.serialize(), {
-      skipPreflight      : false,
-      preflightCommitment: "confirmed",
-    });
-    await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
-    log.ok(`Paid ${amountSOL.toFixed(6)} SOL → ${toAddress} | ${description}`);
-    return sig;
-  } catch (err) {
-    log.error("sendPayout failed:", err.message);
-    return null;
   }
+
+  log.error(`sendPayout gave up after ${retries} attempts for ${description}`);
+  return null;
 }
 
 // ============================================
-// ON-CHAIN PAYMENT VERIFICATION (manual flow)
+// ON-CHAIN PAYMENT VERIFICATION — FIX 2
 // ============================================
 
-async function checkOnChainPayment(memoId) {
+async function checkOnChainPayment(memoId, createdAt) {
   try {
-    const sigs = await connection.getSignaturesForAddress(botWallet.publicKey, { limit: 25 });
+    // FIX 2a: scan more signatures; filter by time to avoid false positives
+    const sigs = await connection.getSignaturesForAddress(botWallet.publicKey, {
+      limit: 100,
+      // Only look at signatures after the bet was created (minus 30s buffer)
+      minContextSlot: undefined,
+    });
+
+    const cutoff = (createdAt || 0) - 30_000; // 30s before bet creation
+
     for (const info of sigs) {
       if (processedTxSignatures.has(info.signature) || info.err) continue;
+      // FIX 2b: skip signatures older than before the bet was placed
+      if (info.blockTime && info.blockTime * 1000 < cutoff) break;
+
       const tx = await connection.getParsedTransaction(info.signature, {
         maxSupportedTransactionVersion: 0,
       });
       if (!tx) continue;
+
       const logs = tx.meta?.logMessages || [];
       if (!logs.some((l) => l.includes(memoId))) continue;
 
       const keys     = tx.transaction.message.accountKeys;
-      const botIndex = keys.findIndex((k) => k.pubkey.toString() === botWallet.publicKey.toString());
+      const botIndex = keys.findIndex(
+        (k) => k.pubkey.toString() === botWallet.publicKey.toString()
+      );
       if (botIndex === -1) continue;
 
-      const received = (tx.meta.postBalances[botIndex] - tx.meta.preBalances[botIndex]) / LAMPORTS_PER_SOL;
+      const received =
+        (tx.meta.postBalances[botIndex] - tx.meta.preBalances[botIndex]) / LAMPORTS_PER_SOL;
       if (received <= 0) continue;
 
-      processedTxSignatures.add(info.signature);
+      addProcessedSig(info.signature); // FIX 3
       return { signature: info.signature, amount: received };
     }
     return null;
@@ -557,32 +637,49 @@ async function checkOnChainPayment(memoId) {
   }
 }
 
+// FIX 8: track active watchers to avoid duplicate polling loops
+const activeWatchers = new Set();
+
 async function watchManualPayment(memoId) {
-  const bet = pendingManualBets.get(memoId);
-  if (!bet) return;
+  // FIX 8: prevent duplicate watchers for the same memo
+  if (activeWatchers.has(memoId)) return;
+  activeWatchers.add(memoId);
 
-  if (Date.now() > bet.expiresAt) {
-    pendingManualBets.delete(memoId);
-    await bot.telegram.sendMessage(
-      bet.chatId,
-      `⏱️ Payment window expired for memo \`${memoId}\`.\nClick a poll button to try again.`,
-      { parse_mode: "Markdown" }
-    ).catch(() => {});
-    return;
+  try {
+    while (true) {
+      const bet = pendingManualBets.get(memoId);
+      if (!bet) break; // cancelled or already confirmed
+
+      if (Date.now() > bet.expiresAt) {
+        pendingManualBets.delete(memoId);
+        await bot.telegram.sendMessage(
+          bet.chatId,
+          `⏱️ Payment window expired for memo \`${memoId}\`.\nClick a poll button to try again.`,
+          { parse_mode: "Markdown" }
+        ).catch(() => {});
+        break;
+      }
+
+      // FIX 2: pass createdAt so we can skip stale transactions
+      const result = await checkOnChainPayment(memoId, bet.createdAt);
+      if (result) {
+        pendingManualBets.delete(memoId);
+        await confirmBet(
+          bet.userId, bet.username, result.amount, bet.choice,
+          result.signature, bet.chatId
+        );
+        break;
+      }
+
+      await new Promise((r) => setTimeout(r, BLOCKCHAIN_POLL_MS));
+    }
+  } finally {
+    activeWatchers.delete(memoId);
   }
-
-  const result = await checkOnChainPayment(memoId);
-  if (result) {
-    await confirmBet(bet.userId, bet.username, result.amount, bet.choice, result.signature, bet.chatId);
-    pendingManualBets.delete(memoId);
-    return;
-  }
-
-  setTimeout(() => watchManualPayment(memoId), BLOCKCHAIN_POLL_MS);
 }
 
 // ============================================
-// BET CONFIRMATION (shared by both flows)
+// BET CONFIRMATION
 // ============================================
 
 async function confirmBet(userId, username, amount, choice, signature, chatId) {
@@ -642,6 +739,7 @@ async function confirmBet(userId, username, amount, choice, signature, chatId) {
     { parse_mode: "Markdown" }
   ).catch(() => {});
 
+  saveState(); // FIX 1: persist after every bet
   await updatePoll();
 }
 
@@ -677,9 +775,9 @@ function buildPollMessage() {
 function getPollKeyboard() {
   return {
     inline_keyboard: [[
-      { text: "🚀 Pump", callback_data: "vote_pump" },
-      { text: "📉 Dump", callback_data: "vote_dump" },
-      { text: "🟡 Flat", callback_data: "vote_stagnate" },
+      { text: "🚀 Pump",  callback_data: "vote_pump"     },
+      { text: "📉 Dump",  callback_data: "vote_dump"     },
+      { text: "🟡 Flat",  callback_data: "vote_stagnate" },
     ]],
   };
 }
@@ -696,7 +794,9 @@ function buildLeaderboardMessage() {
 
   sorted.forEach(([, s], i) => {
     const medal = medals[i] || `${i + 1}.`;
-    const wr = s.totalBets ? ((s.totalWon / Math.max(s.totalStaked, 0.0001)) * 100).toFixed(1) : "0.0";
+    const wr = s.totalBets
+      ? ((s.totalWon / Math.max(s.totalStaked, 0.0001)) * 100).toFixed(1)
+      : "0.0";
     msg += `${medal} *${s.username}*\n`;
     msg += `   💰 Won: ${(s.totalWon || 0).toFixed(4)} SOL | Rate: ${wr}%\n`;
     msg += `   🎯 Bets: ${s.totalBets} | 🔥 Streak: ${s.winStreak}\n`;
@@ -715,7 +815,7 @@ function buildLeaderboardMessage() {
 
 async function updatePoll() {
   try {
-    const text  = buildPollMessage();
+    const text         = buildPollMessage();
     const reply_markup = getPollKeyboard();
 
     if (pollMessageId && pollChatId) {
@@ -725,20 +825,32 @@ async function updatePoll() {
           { parse_mode: "Markdown", reply_markup }
         );
         return;
-      } catch (_) {
+      } catch (err) {
+        log.warn("Poll edit failed, sending new message:", err.message);
         pollMessageId = null;
         pollChatId    = null;
       }
     }
 
-    const sent = await bot.telegram.sendMessage(LIVE_CHANNEL, text, {
-      parse_mode: "Markdown", reply_markup,
-    });
-    pollMessageId = sent.message_id;
-    pollChatId    = sent.chat.id;
-    await bot.telegram.pinChatMessage(LIVE_CHANNEL, sent.message_id).catch(() => {});
+    try {
+      const sent = await bot.telegram.sendMessage(LIVE_CHANNEL, text, {
+        parse_mode: "Markdown", reply_markup,
+      });
+      pollMessageId = sent.message_id;
+      pollChatId    = sent.chat.id;
+      await bot.telegram.pinChatMessage(LIVE_CHANNEL, sent.message_id).catch(() => {});
+    } catch (channelErr) {
+      log.error("Live channel failed, falling back to community group:", channelErr.message);
+      const sent = await bot.telegram.sendMessage(COMMUNITY_GROUP, text, {
+        parse_mode: "Markdown", reply_markup,
+      });
+      pollMessageId = sent.message_id;
+      pollChatId    = sent.chat.id;
+    }
+
+    saveState(); // FIX 1: persist updated message IDs
   } catch (err) {
-    log.error("updatePoll:", err.message);
+    log.error("updatePoll error:", err.message);
   }
 }
 
@@ -763,103 +875,116 @@ async function updateLeaderboard() {
     leaderboardMessageId = sent.message_id;
     leaderboardChatId    = sent.chat.id;
     await bot.telegram.pinChatMessage(COMMUNITY_GROUP, sent.message_id).catch(() => {});
+    saveState();
   } catch (err) {
-    log.error("updateLeaderboard:", err.message);
+    log.error("updateLeaderboard error:", err.message);
   }
 }
 
 // ============================================
-// HOURLY SETTLEMENT
+// HOURLY SETTLEMENT — FIX 5: idempotent lock
 // ============================================
 
 async function settleHour() {
-  log.info("⏰ Hourly settlement");
-
-  if (currentPoll.stakes.length < 2) {
-    await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, "⏰ Not enough bets this hour.").catch(() => {});
-  } else {
-    let winnerChoice;
-    if      (currentPrice > openPrice * 1.001) winnerChoice = "pump";
-    else if (currentPrice < openPrice * 0.999) winnerChoice = "dump";
-    else                                        winnerChoice = "stagnate";
-
-    const emojiMap = { pump: "🚀", dump: "📉", stagnate: "🟡" };
-    const winners  = currentPoll.stakes.filter((s) => s.choice === winnerChoice);
-    const losers   = currentPoll.stakes.filter((s) => s.choice !== winnerChoice);
-    const totalPot = currentPoll.pot;
-    const winPool  = winners.reduce((a, s) => a + s.amount, 0);
-
-    let paidCount = 0, paidAmount = 0;
-
-    for (const w of winners) {
-      const wallet = getUserWallet(w.userId);
-      if (!wallet) continue;
-
-      const share      = w.amount / winPool;
-      const multiplier = getStreakMultiplier(w.userId);
-      const payout     = parseFloat((totalPot * share * multiplier).toFixed(6));
-
-      const sig = await sendPayout(wallet.address, payout, `Hourly win – ${winnerChoice}`);
-      if (sig) {
-        paidCount++;
-        paidAmount += payout;
-
-        const s = userStats.get(w.userId);
-        if (s) {
-          s.totalWon += payout;
-          s.winStreak = (s.winStreak || 0) + 1;
-          if (s.winStreak > (s.bestStreak || 0)) s.bestStreak = s.winStreak;
-          s.xp += 50;
-          if (s.winStreak >= 5)  awardAchievement(w.userId, "HOT_STREAK_5");
-          if (s.winStreak >= 10) awardAchievement(w.userId, "HOT_STREAK_10");
-          if (tournamentActive)  tournamentLB.set(w.userId, (tournamentLB.get(w.userId) || 0) + payout);
-        }
-
-        await bot.telegram.sendMessage(
-          w.userId,
-          `🏆 *You won!*\n\n` +
-          `SOL went *${winnerChoice.toUpperCase()}*\n` +
-          `💰 *+${payout.toFixed(6)} SOL* paid to your wallet\n` +
-          `TX: \`${sig.slice(0, 8)}…${sig.slice(-8)}\``,
-          { parse_mode: "Markdown" }
-        ).catch(() => {});
-      }
-    }
-
-    for (const l of losers) {
-      const s = userStats.get(l.userId);
-      if (s) s.winStreak = 0;
-    }
-
-    await bot.telegram.sendMessage(
-      ANNOUNCEMENTS_CHANNEL,
-      `⏰ *Hourly Results*\n\n` +
-      `${emojiMap[winnerChoice]} Winner: *${winnerChoice.toUpperCase()}*\n` +
-      `Open: $${openPrice.toFixed(4)} → Close: $${currentPrice.toFixed(4)}\n` +
-      `💰 Pot: ${totalPot.toFixed(6)} SOL\n` +
-      `🏆 Winners: ${paidCount} | Paid: ${paidAmount.toFixed(6)} SOL\n` +
-      `🎰 Jackpot: ${jackpotAmountSOL.toFixed(4)} SOL`,
-      { parse_mode: "Markdown" }
-    ).catch(() => {});
-
-    log.ok(`Settlement done: ${paidCount} winners, ${paidAmount.toFixed(6)} SOL`);
+  // FIX 5: prevent double-settlement if cron fires twice or startup races
+  if (settlementInProgress) {
+    log.warn("Settlement already in progress — skipping");
+    return;
   }
+  settlementInProgress = true;
 
-  // Reset poll
-  openPrice    = currentPrice;
-  pollMessageId= null;
-  pollChatId   = null;
-  currentPoll  = {
-    pot: 0, stakes: [],
-    startTime: Date.now(),
-    endTime  : Date.now() + 3_600_000,
-    totalBets: 0,
-  };
+  try {
+    log.info("⏰ Hourly settlement");
 
-  await updatePoll();
-  await updateLeaderboard();
+    if (currentPoll.stakes.length < 2) {
+      await bot.telegram.sendMessage(ANNOUNCEMENTS_CHANNEL, "⏰ Not enough bets this hour.").catch(() => {});
+    } else {
+      let winnerChoice;
+      if      (currentPrice > openPrice * 1.001) winnerChoice = "pump";
+      else if (currentPrice < openPrice * 0.999) winnerChoice = "dump";
+      else                                        winnerChoice = "stagnate";
 
-  if (tournamentActive && Date.now() >= tournamentEndTime) await endTournament();
+      const emojiMap = { pump: "🚀", dump: "📉", stagnate: "🟡" };
+      const winners  = currentPoll.stakes.filter((s) => s.choice === winnerChoice);
+      const losers   = currentPoll.stakes.filter((s) => s.choice !== winnerChoice);
+      const totalPot = currentPoll.pot;
+      const winPool  = winners.reduce((a, s) => a + s.amount, 0);
+
+      let paidCount = 0, paidAmount = 0;
+
+      for (const w of winners) {
+        const wallet = getUserWallet(w.userId);
+        if (!wallet) continue;
+
+        const share      = w.amount / winPool;
+        const multiplier = getStreakMultiplier(w.userId);
+        const payout     = parseFloat((totalPot * share * multiplier).toFixed(6));
+
+        const sig = await sendPayout(wallet.address, payout, `Hourly win – ${winnerChoice}`);
+        if (sig) {
+          paidCount++;
+          paidAmount += payout;
+
+          const s = userStats.get(w.userId);
+          if (s) {
+            s.totalWon  += payout;
+            s.winStreak  = (s.winStreak || 0) + 1;
+            if (s.winStreak > (s.bestStreak || 0)) s.bestStreak = s.winStreak;
+            s.xp += 50;
+            if (s.winStreak >= 5)  awardAchievement(w.userId, "HOT_STREAK_5");
+            if (s.winStreak >= 10) awardAchievement(w.userId, "HOT_STREAK_10");
+            if (tournamentActive)  tournamentLB.set(w.userId, (tournamentLB.get(w.userId) || 0) + payout);
+          }
+
+          await bot.telegram.sendMessage(
+            w.userId,
+            `🏆 *You won!*\n\n` +
+            `SOL went *${winnerChoice.toUpperCase()}*\n` +
+            `💰 *+${payout.toFixed(6)} SOL* paid to your wallet\n` +
+            `TX: \`${sig.slice(0, 8)}…${sig.slice(-8)}\``,
+            { parse_mode: "Markdown" }
+          ).catch(() => {});
+        }
+      }
+
+      for (const l of losers) {
+        const s = userStats.get(l.userId);
+        if (s) s.winStreak = 0;
+      }
+
+      await bot.telegram.sendMessage(
+        ANNOUNCEMENTS_CHANNEL,
+        `⏰ *Hourly Results*\n\n` +
+        `${emojiMap[winnerChoice]} Winner: *${winnerChoice.toUpperCase()}*\n` +
+        `Open: $${openPrice.toFixed(4)} → Close: $${currentPrice.toFixed(4)}\n` +
+        `💰 Pot: ${totalPot.toFixed(6)} SOL\n` +
+        `🏆 Winners: ${paidCount} | Paid: ${paidAmount.toFixed(6)} SOL\n` +
+        `🎰 Jackpot: ${jackpotAmountSOL.toFixed(4)} SOL`,
+        { parse_mode: "Markdown" }
+      ).catch(() => {});
+
+      log.ok(`Settlement done: ${paidCount} winners, ${paidAmount.toFixed(6)} SOL`);
+    }
+
+    // Reset poll
+    openPrice    = currentPrice;
+    pollMessageId = null;
+    pollChatId    = null;
+    currentPoll  = {
+      pot: 0, stakes: [],
+      startTime: Date.now(),
+      endTime  : Date.now() + 3_600_000,
+      totalBets: 0,
+    };
+
+    await updatePoll();
+    await updateLeaderboard();
+    saveState(); // FIX 1: persist after settlement
+
+    if (tournamentActive && Date.now() >= tournamentEndTime) await endTournament();
+  } finally {
+    settlementInProgress = false;
+  }
 }
 
 // ============================================
@@ -892,7 +1017,6 @@ bot.start(async (ctx) => {
   const username = ctx.from.username || ctx.from.first_name || "User";
   const name     = ctx.from.first_name || "Degen";
 
-  // Handle referral
   const args = ctx.message.text.split(" ");
   if (args[1]?.startsWith("ref_")) {
     const code       = args[1].slice(4);
@@ -900,16 +1024,17 @@ bot.start(async (ctx) => {
     if (referrerId && referrerId !== userId && !userReferrals.has(userId)) {
       userReferrals.set(userId, { referredBy: referrerId });
       const rs = userStats.get(referrerId);
-      if (rs) { rs.xp += 50; }
+      if (rs) rs.xp += 50;
       await bot.telegram.sendMessage(referrerId,
-        `🤝 Someone joined via your referral link! +50 XP`, {}
+        `🤝 Someone joined via your referral link! +50 XP`
       ).catch(() => {});
+      saveState();
     }
   }
 
   const wallet = getUserWallet(userId);
   const walletStatus = wallet
-    ? `✅ Wallet: \`${wallet.address.slice(0,6)}…${wallet.address.slice(-4)}\` (${wallet.via})`
+    ? `✅ Wallet: \`${wallet.address.slice(0, 6)}…${wallet.address.slice(-4)}\` (${wallet.via})`
     : "❌ No wallet connected";
 
   await ctx.reply(
@@ -929,7 +1054,6 @@ bot.start(async (ctx) => {
 bot.command("connect", async (ctx) => {
   const userId = ctx.from.id.toString();
   const { url } = buildPhantomConnectUrl(userId);
-
   await ctx.reply(
     `🔌 *Connect Phantom Wallet*\n\n` +
     `*Mobile:* Tap the button — Phantom app opens automatically\n` +
@@ -963,6 +1087,7 @@ bot.command("register", async (ctx) => {
 
   const balance = await checkBalance(address);
   userWallets.set(userId, { address, username, registeredAt: Date.now(), via: "manual" });
+  saveState();
 
   return ctx.reply(
     `✅ *Wallet Registered!*\n\n` +
@@ -1006,8 +1131,20 @@ bot.command("daily", async (ctx) => {
   if (!result.success) {
     return ctx.reply(`⏳ Next daily in *${Math.ceil(result.hoursLeft)}h*`, { parse_mode: "Markdown" });
   }
+
+  saveState();
+
+  // FIX 9: tell the user if they have no wallet registered
   const wallet = getUserWallet(userId);
-  if (wallet) await sendPayout(wallet.address, result.reward, "Daily reward");
+  if (!wallet) {
+    return ctx.reply(
+      `✅ *Daily Reward Earned!*\n\n💰 ${result.reward} SOL\n🔥 Streak: ${result.streak} day${result.streak > 1 ? "s" : ""}\n\n` +
+      `⚠️ No wallet registered — use /connect or /register to receive your reward.`,
+      { parse_mode: "Markdown" }
+    );
+  }
+
+  await sendPayout(wallet.address, result.reward, "Daily reward");
   ctx.reply(
     `✅ *Daily Reward Claimed!*\n\n💰 ${result.reward} SOL\n🔥 Streak: ${result.streak} day${result.streak > 1 ? "s" : ""}`,
     { parse_mode: "Markdown" }
@@ -1029,7 +1166,9 @@ bot.command("stats", (ctx) => {
   const userId = ctx.from.id.toString();
   const s      = userStats.get(userId);
   if (!s) return ctx.reply("No stats yet. Place a bet first!");
-  const wr = s.totalBets ? ((s.totalWon / Math.max(s.totalStaked, 0.0001)) * 100).toFixed(1) : "0.0";
+  const wr = s.totalBets
+    ? ((s.totalWon / Math.max(s.totalStaked, 0.0001)) * 100).toFixed(1)
+    : "0.0";
   ctx.reply(
     `📊 *Your Stats*\n\n` +
     `Bets: ${s.totalBets}\n` +
@@ -1066,7 +1205,6 @@ bot.command("cancel", (ctx) => {
   const userId = ctx.from.id.toString();
   const inp    = pendingAmountInput.get(userId);
   if (inp) { clearTimeout(inp.timeoutHandle); pendingAmountInput.delete(userId); }
-  // Clear any manual pending bets for this user
   for (const [memoId, bet] of pendingManualBets.entries()) {
     if (bet.userId === userId) {
       clearTimeout(bet.timeoutHandle);
@@ -1108,14 +1246,16 @@ bot.command("debug", async (ctx) => {
     `Users with wallets: ${userWallets.size}\n` +
     `Total users: ${userStats.size}\n` +
     `Pending manual bets: ${pendingManualBets.size}\n` +
+    `Active watchers: ${activeWatchers.size}\n` +
     `Pending amount inputs: ${pendingAmountInput.size}\n` +
+    `Processed sigs (cached): ${processedTxSignatures.size}\n` +
     `Tournament: ${tournamentActive ? "Active" : "Off"}\n` +
+    `Settlement lock: ${settlementInProgress}\n` +
     `Uptime: ${Math.floor(process.uptime())}s`,
     { parse_mode: "Markdown" }
   );
 });
 
-// Admin: start tournament
 bot.command("starttournament", async (ctx) => {
   if (!ADMIN_IDS.includes(ctx.from.id.toString())) return;
   const hours = parseInt(ctx.message.text.split(" ")[1]) || 24;
@@ -1129,7 +1269,7 @@ bot.command("starttournament", async (ctx) => {
 });
 
 // ============================================
-// VOTE BUTTON HANDLER
+// VOTE BUTTON HANDLER — FIX 6: per-user cooldown
 // ============================================
 
 bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
@@ -1140,17 +1280,21 @@ bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
   const choice   = ctx.match[1];
   const wallet   = getUserWallet(userId);
 
-  // Check for existing pending input
+  // FIX 6: cooldown to prevent rapid button spam
+  const lastVote = voteActionCooldown.get(userId) || 0;
+  if (Date.now() - lastVote < VOTE_COOLDOWN_MS) {
+    return ctx.answerCbQuery("⏳ Please wait a moment before voting again.").catch(() => {});
+  }
+  voteActionCooldown.set(userId, Date.now());
+
   if (pendingAmountInput.has(userId)) {
     return ctx.reply("⚠️ You already have a pending bet. Use /cancel first.").catch(() => {});
   }
 
   if (!wallet) {
-    // Show both options
     const { url } = buildPhantomConnectUrl(userId);
     return ctx.reply(
-      `🔌 *Connect a wallet first*\n\n` +
-      `Choose one:`,
+      `🔌 *Connect a wallet first*\n\nChoose one:`,
       {
         parse_mode: "Markdown",
         reply_markup: {
@@ -1170,7 +1314,11 @@ bot.action(/^vote_(pump|dump|stagnate)$/, async (ctx) => {
     bot.telegram.sendMessage(ctx.chat.id, "⏱️ Timed out. Click a button to try again.").catch(() => {});
   }, PAYMENT_TIMEOUT_MS);
 
-  pendingAmountInput.set(userId, { choice, username, chatId: ctx.chat.id, timeoutHandle });
+  pendingAmountInput.set(userId, {
+    choice, username,
+    chatId: ctx.chat.id,
+    timeoutHandle,
+  });
 
   await ctx.reply(
     `${emoji} *${choice.toUpperCase()}* on SOL!\n\nEnter stake amount in SOL _(min ${MIN_STAKE}):_`,
@@ -1191,7 +1339,7 @@ bot.action("show_register", async (ctx) => {
 // ============================================
 
 bot.on("text", async (ctx) => {
-  const text   = ctx.message.text.trim();
+  const text = ctx.message.text.trim();
   if (text.startsWith("/")) return;
 
   const userId  = ctx.from.id.toString();
@@ -1211,19 +1359,22 @@ bot.on("text", async (ctx) => {
   const rakeAmt = parseFloat((amount * RAKE_PERCENT).toFixed(6));
   const botAmt  = parseFloat((amount * (POT_PERCENT + JACKPOT_PERCENT)).toFixed(6));
 
-  // ── PHANTOM FLOW (both mobile + desktop) ──
-  // Build a session for this pending bet
+  // Phantom flow
   const sessionId = generateSessionId();
   phantomSessions.set(sessionId, { userId, createdAt: Date.now(), walletAddress: wallet.address });
-  pendingPhantomBets.set(sessionId, { userId, username: pending.username, amount, choice: pending.choice, chatId: pending.chatId || ctx.chat.id });
-
-  // Auto-expire
+  pendingPhantomBets.set(sessionId, {
+    userId,
+    username: pending.username,
+    amount,
+    choice: pending.choice,
+    chatId: pending.chatId || ctx.chat.id,
+  });
   setTimeout(() => {
     phantomSessions.delete(sessionId);
     pendingPhantomBets.delete(sessionId);
   }, PAYMENT_TIMEOUT_MS);
 
-  let txUrl;
+  let txUrl = null;
   try {
     txUrl = await buildPhantomTxUrl(
       sessionId,
@@ -1232,33 +1383,37 @@ bot.on("text", async (ctx) => {
       amount * LAMPORTS_PER_SOL
     );
   } catch (err) {
-    log.error("buildPhantomTxUrl:", err.message);
-    // Fall through to manual flow
-    txUrl = null;
+    log.error("buildPhantomTxUrl error:", err.message);
   }
 
-  // ── MANUAL FLOW (memo-based on-chain verification) ──
+  // Manual flow
   const memoId    = generateMemoId();
-  const expiresAt = Date.now() + PAYMENT_TIMEOUT_MS;
+  const createdAt = Date.now();
+  const expiresAt = createdAt + PAYMENT_TIMEOUT_MS;
+
   const timeoutHandle = setTimeout(() => {
     pendingManualBets.delete(memoId);
-    bot.telegram.sendMessage(ctx.chat.id, `⏱️ Manual payment window expired for memo \`${memoId}\`.`, { parse_mode: "Markdown" }).catch(() => {});
+    bot.telegram.sendMessage(
+      ctx.chat.id,
+      `⏱️ Manual payment window expired for memo \`${memoId}\`.`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
   }, PAYMENT_TIMEOUT_MS);
 
   pendingManualBets.set(memoId, {
     userId,
     username: pending.username,
     amount,
-    choice: pending.choice,
-    chatId : ctx.chat.id,
+    choice  : pending.choice,
+    chatId  : ctx.chat.id,
+    createdAt,       // FIX 2: store creation time
     expiresAt,
     timeoutHandle,
   });
 
-  // Start watching chain for manual payment
-  setTimeout(() => watchManualPayment(memoId), BLOCKCHAIN_POLL_MS);
+  // FIX 8: start watcher as async loop (no recursive setTimeout)
+  watchManualPayment(memoId).catch((err) => log.error("watchManualPayment error:", err.message));
 
-  // Build reply with both options
   const keyboard = txUrl
     ? { inline_keyboard: [[{ text: "💎 Approve in Phantom", url: txUrl }]] }
     : undefined;
@@ -1283,7 +1438,7 @@ bot.on("text", async (ctx) => {
 });
 
 // ============================================
-// EXPRESS SERVER + PHANTOM CALLBACK
+// EXPRESS SERVER + PHANTOM CALLBACK — FIX 7
 // ============================================
 
 const app = express();
@@ -1293,26 +1448,26 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/", (_, res) => res.send("Degen Echo Bot — Running ✅"));
 
 app.get("/health", (_, res) => res.json({
-  status  : "ok",
-  uptime  : Math.floor(process.uptime()),
-  price   : currentPrice,
-  jackpot : jackpotAmountSOL,
-  pot     : currentPoll.pot,
-  stakes  : currentPoll.stakes.length,
-  users   : userStats.size,
-  wallets : userWallets.size,
+  status    : "ok",
+  uptime    : Math.floor(process.uptime()),
+  price     : currentPrice,
+  jackpot   : jackpotAmountSOL,
+  pot       : currentPoll.pot,
+  stakes    : currentPoll.stakes.length,
+  users     : userStats.size,
+  wallets   : userWallets.size,
   tournament: tournamentActive,
 }));
 
-/**
- * Phantom callback — handles both:
- *  1. Wallet connection (public_key param)
- *  2. Transaction confirmation (transaction_signature param)
- */
 app.get("/phantom/callback", async (req, res) => {
   const { session: sessionId, public_key, transaction_signature, errorCode, errorMessage } = req.query;
 
-  log.info("Phantom callback:", { sessionId, public_key: public_key?.slice(0,8), transaction_signature: transaction_signature?.slice(0,8), errorCode });
+  log.info("Phantom callback:", {
+    sessionId,
+    public_key           : public_key?.slice(0, 8),
+    transaction_signature: transaction_signature?.slice(0, 8),
+    errorCode,
+  });
 
   const htmlClose = (msg) => res.send(`
     <!DOCTYPE html>
@@ -1321,14 +1476,9 @@ app.get("/phantom/callback", async (req, res) => {
       <style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#1a1a2e;color:#fff;}
       .box{text-align:center;padding:2rem;}</style></head>
       <body><div class="box">
-        <h2>🎰 Degen Echo</h2>
-        <p>${msg}</p>
+        <h2>🎰 Degen Echo</h2><p>${msg}</p>
         <p><small>You can close this window</small></p>
-        <script>
-          setTimeout(() => {
-            if(window.opener) window.close();
-          }, 2000);
-        </script>
+        <script>setTimeout(() => { if(window.opener) window.close(); }, 2000);</script>
       </div></body>
     </html>
   `);
@@ -1345,8 +1495,13 @@ app.get("/phantom/callback", async (req, res) => {
     return htmlClose("❌ Connection failed. Please try again.");
   }
 
-  // ── WALLET CONNECTION ──
+  // FIX 7: validate public_key is a real Solana address before saving
   if (public_key && sessionId) {
+    if (!isValidSolanaAddress(public_key)) {
+      log.warn("Phantom callback: invalid public_key received:", public_key);
+      return htmlClose("❌ Invalid wallet address received.");
+    }
+
     const session = getPhantomSession(sessionId);
     if (session) {
       session.walletAddress = public_key;
@@ -1354,13 +1509,14 @@ app.get("/phantom/callback", async (req, res) => {
 
       const username = userStats.get(session.userId)?.username || "User";
       userWallets.set(session.userId, {
-        address      : public_key,
+        address     : public_key,
         username,
-        registeredAt : Date.now(),
-        via          : "phantom",
+        registeredAt: Date.now(),
+        via         : "phantom",
       });
 
-      log.ok(`Phantom wallet connected: ${public_key.slice(0,8)}… for user ${session.userId}`);
+      saveState(); // FIX 1: persist new wallet connection
+      log.ok(`Phantom wallet connected: ${public_key.slice(0, 8)}… for user ${session.userId}`);
 
       await bot.telegram.sendMessage(
         session.userId,
@@ -1372,12 +1528,12 @@ app.get("/phantom/callback", async (req, res) => {
     }
   }
 
-  // ── TRANSACTION CONFIRMATION ──
+  // Transaction confirmation
   if (transaction_signature && sessionId) {
     const betData = pendingPhantomBets.get(sessionId);
     if (betData) {
       pendingPhantomBets.delete(sessionId);
-      processedTxSignatures.add(transaction_signature);
+      addProcessedSig(transaction_signature); // FIX 3
 
       await confirmBet(
         betData.userId,
@@ -1401,31 +1557,28 @@ app.listen(PORT, "0.0.0.0", () => log.ok(`Server on port ${PORT}`));
 // CRON JOBS
 // ============================================
 
-// Hourly settlement + new poll
 cron.schedule("0 * * * *", settleHour);
-
-// Update poll display every 30 seconds
 cron.schedule("*/30 * * * * *", updatePoll);
-
-// Update leaderboard every 5 minutes
 cron.schedule("*/5 * * * *", updateLeaderboard);
-
-// Check tournament end every minute
 cron.schedule("* * * * *", () => {
   if (tournamentActive && Date.now() >= tournamentEndTime) endTournament();
 });
 
-// Cleanup processed tx set daily
+// FIX 3: daily cleanup now only handles rate limit map (sig cleanup is inline)
 cron.schedule("0 0 * * *", () => {
-  if (processedTxSignatures.size > 2000) {
-    [...processedTxSignatures].slice(0, 1000).forEach((s) => processedTxSignatures.delete(s));
-  }
-  // Clean expired rate limit entries
   const now = Date.now();
   for (const [uid, e] of rateLimitMap.entries()) {
     if (now - e.windowStart > RATE_WINDOW_MS * 2) rateLimitMap.delete(uid);
   }
+  // Also clear stale vote cooldowns
+  for (const [uid, ts] of voteActionCooldown.entries()) {
+    if (now - ts > 3_600_000) voteActionCooldown.delete(uid);
+  }
+  log.info("Daily cleanup done");
 });
+
+// FIX 1: periodic auto-save every 5 minutes as safety net
+cron.schedule("*/5 * * * *", saveState);
 
 // ============================================
 // STARTUP
@@ -1434,22 +1587,37 @@ cron.schedule("0 0 * * *", () => {
 async function startup() {
   log.info("Starting Degen Echo Bot…");
 
+  // FIX 1: load persisted state before anything else
+  loadState();
+
   connectPriceWebSocket();
 
-  // Wait up to 15s for first price
   for (let i = 0; i < 15; i++) {
     if (currentPrice > 0) { log.ok(`Price: ${formatPrice()}`); break; }
     await new Promise((r) => setTimeout(r, 1000));
   }
   if (currentPrice <= 0) { currentPrice = 20; log.warn("Using fallback price $20"); }
-  openPrice = currentPrice;
 
-  // Post initial poll and leaderboard
+  // Only reset openPrice if we don't have a persisted one
+  if (!openPrice) openPrice = currentPrice;
+
   await updatePoll();
   await updateLeaderboard();
-
   log.ok("✅ Startup complete!");
 }
+
+// ============================================
+// FIX 10: global unhandled rejection handler
+// ============================================
+
+process.on("unhandledRejection", (reason, promise) => {
+  log.error("Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  log.error("Uncaught exception:", err.message, err.stack);
+  // Don't exit — log and continue for non-fatal errors
+});
 
 // ============================================
 // LAUNCH
@@ -1472,6 +1640,7 @@ bot.launch({ dropPendingUpdates: true })
 for (const sig of ["SIGINT", "SIGTERM"]) {
   process.once(sig, () => {
     log.info("Shutting down…");
+    saveState(); // FIX 1: save on graceful shutdown
     bot.stop(sig);
     if (ws) ws.close();
     setTimeout(() => process.exit(0), 2000);
