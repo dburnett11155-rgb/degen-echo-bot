@@ -1,26 +1,39 @@
 {
   "name": "degen-echo-bot",
-  "version": "3.0.0",
-  "description": "ULTIMATE Telegram betting bot with Solana integration - Viral, Addictive, Auto-paying",
+  "version": "1.0.0",
+  "description": "Telegram prediction market bot on Solana",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "node --watch index.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.87.6",
-    "telegraf": "^4.15.3",
-    "ws": "^8.14.2",
-    "express": "^4.18.2",
-    "node-cron": "^3.0.3",
-    "canvas": "^2.11.2",
+    "@solana/web3.js": "^1.95.4",
+    "axios": "^1.7.7",
     "bs58": "^5.0.0",
-    "dotenv": "^16.3.1"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.1"
-  },
-  "engines": {
-    "node": "18.x"
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3",
+    "telegraf": "^4.16.3",
+    "ws": "^8.18.0"
   }
 }
+```
+
+---
+
+### .env.example
+```
+BOT_TOKEN=
+BOT_PRIVATE_KEY=
+RAKE_WALLET=
+ADMIN_TELEGRAM_ID=
+JACKPOT_USDC_WALLET=
+SOLANA_RPC=https://api.mainnet-beta.solana.com
+LIVE_CHANNEL=@degenecholive
+ANNOUNCEMENTS_CHANNEL=@degenechochamber
+COMMUNITY_GROUP=@degenechochat
+PORT=3000
